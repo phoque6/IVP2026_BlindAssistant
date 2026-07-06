@@ -7,7 +7,11 @@ blind-navigation voice alerts.
 
 Install:
     sudo apt update
-    sudo apt install python3-serial python3-pygame python3-numpy espeak
+    sudo apt install python3-serial python3-pygame python3-numpy espeak-ng
+
+If no sound, test in terminal:
+    espeak-ng "Voice test"
+    amixer set Master 80%
 
 Run:
     python3 d6_aa55_clear_room_mapper_blind_alert.py
@@ -36,6 +40,7 @@ import csv
 import math
 import os
 import random
+import shutil
 import struct
 import subprocess
 import threading
@@ -95,16 +100,16 @@ VERY_CLOSE_DISTANCE_M = 0.45
 ENABLE_VOICE_ALERTS = True
 VOICE_COOLDOWN_SECONDS = 5.0   # minimum gap between ANY spoken messages
 VOICE_REPEAT_SECONDS = 12.0    # re-announce same danger only after this long (if still present)
-VOICE_MIN_DETECTIONS = 15      # ~15 consecutive scans before speaking (reduces false alarms)
-VERY_CLOSE_VOICE_MIN = 8       # emergency stop — still faster than normal, but not instant chatter
+VOICE_MIN_DETECTIONS = 10      # consecutive scans before speaking
+VERY_CLOSE_VOICE_MIN = 6       # emergency stop — faster but still stable
 ZONE_CLEAR_SCANS = 4           # need several clear scans before resetting detection streak
 MOVING_DISTANCE_M = 0.15       # metres shift to count as moving object
 MOVING_MIN_SCANS = 5           # scans needed to confirm movement for early voice
 
-# espeak: speed (words/min, default ~175), amplitude (0-200), gap between words (ms)
-ESPEAK_SPEED = 115             # slower = easier to understand
+# espeak: speed (words/min — 160-175 is normal conversational pace)
+ESPEAK_SPEED = 165
 ESPEAK_AMPLITUDE = 200
-ESPEAK_WORD_GAP_MS = 12
+ESPEAK_WORD_GAP_MS = 5
 
 # ---------------------------------------------------------------------------
 # Save filenames
@@ -154,13 +159,15 @@ nearest_distance_m = None
 nearest_left_m = None
 nearest_front_m = None
 nearest_right_m = None
+nearest_back_m = None
 
 last_spoken_warning = ""
 last_voice_time = 0.0
 last_confirmed_warning = ""
 clear_streak = 0
 current_voice_process = None
-espeak_available = None
+tts_executable = None          # resolved path to espeak-ng or espeak
+tts_checked = False
 
 # Display toggles
 show_rays = True
@@ -171,8 +178,8 @@ view_mode = VIEW_MAP           # MAP view is clearest for room outline
 voice_enabled = ENABLE_VOICE_ALERTS
 
 # Voice confirmation tracking (reduces false spoken alerts)
-zone_streak = {"FRONT": 0, "LEFT": 0, "RIGHT": 0, "BOTH": 0, "VERY_CLOSE": 0}
-zone_position_history = {"FRONT": [], "LEFT": [], "RIGHT": [], "BOTH": []}
+zone_streak = {"FRONT": 0, "BACK": 0, "LEFT": 0, "RIGHT": 0, "BOTH": 0, "VERY_CLOSE": 0}
+zone_position_history = {"FRONT": [], "BACK": [], "LEFT": [], "RIGHT": [], "BOTH": []}
 voice_confirmed = False        # True when voice is allowed to speak current warning
 display_warning_state = "CLEAR"
 
@@ -393,7 +400,7 @@ def process_scan(scan_polar):
 
 def clear_map():
     global points_xy, free_grid, occupied_grid, latest_scan_points
-    global packet_count, warning_state, nearest_left_m, nearest_front_m, nearest_right_m
+    global packet_count, warning_state, nearest_left_m, nearest_front_m, nearest_right_m, nearest_back_m
     global zone_streak, zone_position_history, voice_confirmed, display_warning_state
     global clear_streak, last_confirmed_warning, current_voice_process
     with data_lock:
@@ -404,7 +411,7 @@ def clear_map():
         packet_count = 0
         warning_state = "CLEAR"
         display_warning_state = "CLEAR"
-        nearest_left_m = nearest_front_m = nearest_right_m = None
+        nearest_left_m = nearest_front_m = nearest_right_m = nearest_back_m = None
         for key in zone_streak:
             zone_streak[key] = 0
         for key in zone_position_history:
@@ -496,25 +503,42 @@ def generate_simulated_scan():
 
 def detect_obstacles_for_blind_user(latest_points):
     """
-    Detect obstacles within ALERT_DISTANCE_M for blind navigation.
+    Detect obstacles within ALERT_DISTANCE_M in front, back, left, or right.
     Returns (warning_state, nearest_distance, direction).
     """
-    front_near = None
-    left_near = None
-    right_near = None
-    very_close = False
+    front_near = back_near = left_near = right_near = None
     overall_near = None
+
+    # Very close hits per direction (for stop message with location)
+    vc_front = vc_back = vc_left = vc_right = None
 
     for x_m, y_m, distance_m, _angle in latest_points:
         if overall_near is None or distance_m < overall_near:
             overall_near = distance_m
 
+        # --- very close (any direction) ---
         if distance_m <= VERY_CLOSE_DISTANCE_M:
-            very_close = True
+            if x_m > 0 and abs(y_m) <= 0.45:
+                if vc_front is None or distance_m < vc_front:
+                    vc_front = distance_m
+            elif x_m < 0 and abs(y_m) <= 0.45:
+                if vc_back is None or distance_m < vc_back:
+                    vc_back = distance_m
+            elif y_m < -0.25:
+                if vc_left is None or distance_m < vc_left:
+                    vc_left = distance_m
+            elif y_m > 0.25:
+                if vc_right is None or distance_m < vc_right:
+                    vc_right = distance_m
 
+        # --- within 1 metre zones ---
         if x_m > 0 and abs(y_m) <= 0.40 and distance_m <= ALERT_DISTANCE_M:
             if front_near is None or distance_m < front_near:
                 front_near = distance_m
+
+        if x_m < 0 and abs(y_m) <= 0.40 and distance_m <= ALERT_DISTANCE_M:
+            if back_near is None or distance_m < back_near:
+                back_near = distance_m
 
         if y_m < -0.30 and abs(x_m) <= 1.0 and distance_m <= ALERT_DISTANCE_M:
             if left_near is None or distance_m < left_near:
@@ -524,48 +548,72 @@ def detect_obstacles_for_blind_user(latest_points):
             if right_near is None or distance_m < right_near:
                 right_near = distance_m
 
-    if very_close:
-        return "STOP! OBJECT VERY CLOSE", overall_near, "FRONT"
+    # Emergency stop — say which side is very close (closest wins)
+    vc_zones = []
+    if vc_front is not None:
+        vc_zones.append(("STOP! VERY CLOSE IN FRONT", vc_front, "FRONT"))
+    if vc_back is not None:
+        vc_zones.append(("STOP! VERY CLOSE BEHIND", vc_back, "BACK"))
+    if vc_left is not None:
+        vc_zones.append(("STOP! VERY CLOSE ON LEFT", vc_left, "LEFT"))
+    if vc_right is not None:
+        vc_zones.append(("STOP! VERY CLOSE ON RIGHT", vc_right, "RIGHT"))
+    if vc_zones:
+        vc_zones.sort(key=lambda z: z[1])
+        return vc_zones[0]
 
     if left_near is not None and right_near is not None:
-        return "OBSTACLES LEFT AND RIGHT WITHIN 1 METRE", min(left_near, right_near), "BOTH"
+        return "OBSTACLES LEFT AND RIGHT", min(left_near, right_near), "BOTH"
 
     if front_near is not None:
-        return "OBSTACLE AHEAD WITHIN 1 METRE", front_near, "FRONT"
+        return "OBSTACLE IN FRONT", front_near, "FRONT"
+    if back_near is not None:
+        return "OBSTACLE BEHIND", back_near, "BACK"
     if left_near is not None:
-        return "OBSTACLE LEFT WITHIN 1 METRE", left_near, "LEFT"
+        return "OBSTACLE ON LEFT", left_near, "LEFT"
     if right_near is not None:
-        return "OBSTACLE RIGHT WITHIN 1 METRE", right_near, "RIGHT"
+        return "OBSTACLE ON RIGHT", right_near, "RIGHT"
 
     return "CLEAR", overall_near, ""
 
 
 def compute_direction_distances(latest_points):
-    """Nearest obstacle in left / front / right sectors."""
-    left_d = front_d = right_d = None
+    """Nearest obstacle in back / left / front / right sectors."""
+    back_d = left_d = front_d = right_d = None
     for x_m, y_m, distance_m, _a in latest_points:
         if x_m > 0 and abs(y_m) <= 0.45:
             if front_d is None or distance_m < front_d:
                 front_d = distance_m
+        if x_m < 0 and abs(y_m) <= 0.45:
+            if back_d is None or distance_m < back_d:
+                back_d = distance_m
         if y_m < -0.25:
             if left_d is None or distance_m < left_d:
                 left_d = distance_m
         if y_m > 0.25:
             if right_d is None or distance_m < right_d:
                 right_d = distance_m
-    return left_d, front_d, right_d
+    return back_d, left_d, front_d, right_d
 
 
 def state_to_zone_key(state):
-    if "STOP" in state or "VERY CLOSE" in state:
+    if "VERY CLOSE" in state or "STOP" in state:
+        if "BEHIND" in state:
+            return "VERY_CLOSE"
+        if "LEFT" in state:
+            return "VERY_CLOSE"
+        if "RIGHT" in state:
+            return "VERY_CLOSE"
         return "VERY_CLOSE"
     if "LEFT AND RIGHT" in state:
         return "BOTH"
-    if "LEFT" in state:
+    if "BEHIND" in state:
+        return "BACK"
+    if "ON LEFT" in state or ("LEFT" in state and "RIGHT" not in state):
         return "LEFT"
-    if "RIGHT" in state:
+    if "ON RIGHT" in state or "RIGHT" in state:
         return "RIGHT"
-    if "AHEAD" in state:
+    if "FRONT" in state or "AHEAD" in state:
         return "FRONT"
     return None
 
@@ -577,6 +625,8 @@ def points_in_zone(zone, points):
         if zone == "VERY_CLOSE" and distance_m <= VERY_CLOSE_DISTANCE_M:
             matched.append((x_m, y_m, distance_m))
         elif zone == "FRONT" and x_m > 0 and abs(y_m) <= 0.40 and distance_m <= ALERT_DISTANCE_M:
+            matched.append((x_m, y_m, distance_m))
+        elif zone == "BACK" and x_m < 0 and abs(y_m) <= 0.40 and distance_m <= ALERT_DISTANCE_M:
             matched.append((x_m, y_m, distance_m))
         elif zone == "LEFT" and y_m < -0.30 and abs(x_m) <= 1.0 and distance_m <= ALERT_DISTANCE_M:
             matched.append((x_m, y_m, distance_m))
@@ -662,17 +712,18 @@ def update_voice_confirmation(raw_state, latest_points):
 def update_alerts():
     """Update warning state, voice confirmation, and direction distances."""
     global warning_state, warning_direction, nearest_distance_m
-    global nearest_left_m, nearest_front_m, nearest_right_m
+    global nearest_left_m, nearest_front_m, nearest_right_m, nearest_back_m
 
     with data_lock:
         latest = list(latest_scan_points)
 
     state, nearest, direction = detect_obstacles_for_blind_user(latest)
-    left_d, front_d, right_d = compute_direction_distances(latest)
+    back_d, left_d, front_d, right_d = compute_direction_distances(latest)
 
     warning_state = state
     warning_direction = direction
     nearest_distance_m = nearest
+    nearest_back_m = back_d
     nearest_left_m = left_d
     nearest_front_m = front_d
     nearest_right_m = right_d
@@ -684,28 +735,59 @@ def update_alerts():
 # PART 8 — AUDIO FEEDBACK
 # =============================================================================
 
-def check_espeak():
-    global espeak_available
-    if espeak_available is not None:
-        return espeak_available
-    try:
-        subprocess.run(["which", "espeak"], capture_output=True, check=True)
-        espeak_available = True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        espeak_available = False
-        print("NOTE: espeak not found. Install: sudo apt install espeak")
-    return espeak_available
+def find_tts_executable():
+    """
+    Find a text-to-speech program on the Pi.
+    Raspberry Pi OS often has espeak-ng, not espeak.
+    """
+    for name in ("espeak-ng", "espeak"):
+        path = shutil.which(name)
+        if path:
+            return path
+    # Common absolute paths on Debian / Raspberry Pi OS
+    for path in ("/usr/bin/espeak-ng", "/usr/bin/espeak"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def init_voice_system():
+    """Detect TTS at startup and print clear setup instructions."""
+    global tts_executable, tts_checked
+    tts_executable = find_tts_executable()
+    tts_checked = True
+    if tts_executable:
+        print(f"Voice OK: using {tts_executable}")
+    else:
+        print("=" * 60)
+        print("VOICE NOT AVAILABLE — install text-to-speech:")
+        print("  sudo apt update")
+        print("  sudo apt install espeak-ng")
+        print("Then test:  espeak-ng \"Voice test\"")
+        print("Also check volume:  amixer set Master 80%")
+        print("=" * 60)
+
+
+def check_tts():
+    global tts_executable, tts_checked
+    if not tts_checked:
+        init_voice_system()
+    return tts_executable is not None
 
 
 def warning_to_speech(state):
-    """Short, clear phrases — easier to hear at slow speed."""
+    """Clear directional phrases at normal speaking speed."""
     mapping = {
         "CLEAR": "Path clear",
-        "OBSTACLE AHEAD WITHIN 1 METRE": "Obstacle ahead",
-        "OBSTACLE LEFT WITHIN 1 METRE": "Obstacle on left",
-        "OBSTACLE RIGHT WITHIN 1 METRE": "Obstacle on right",
-        "OBSTACLES LEFT AND RIGHT WITHIN 1 METRE": "Obstacles left and right",
-        "STOP! OBJECT VERY CLOSE": "Stop. Object very close",
+        "OBSTACLE IN FRONT": "Obstacle in front",
+        "OBSTACLE BEHIND": "Obstacle behind",
+        "OBSTACLE ON LEFT": "Obstacle on left",
+        "OBSTACLE ON RIGHT": "Obstacle on right",
+        "OBSTACLES LEFT AND RIGHT": "Obstacles on left and right",
+        "STOP! VERY CLOSE IN FRONT": "Stop. Obstacle very close in front",
+        "STOP! VERY CLOSE BEHIND": "Stop. Obstacle very close behind",
+        "STOP! VERY CLOSE ON LEFT": "Stop. Obstacle very close on left",
+        "STOP! VERY CLOSE ON RIGHT": "Stop. Obstacle very close on right",
     }
     return mapping.get(state, state)
 
@@ -718,8 +800,67 @@ def stop_current_voice():
             current_voice_process.terminate()
             current_voice_process.wait(timeout=0.5)
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            try:
+                current_voice_process.kill()
+            except OSError:
+                pass
     current_voice_process = None
+
+
+def run_tts(text):
+    """
+    Run text-to-speech. Tries subprocess first, then shell fallback.
+    Returns True if a TTS command was started.
+    """
+    global current_voice_process
+
+    if not check_tts():
+        return False
+
+    args = [
+        tts_executable,
+        "-s", str(ESPEAK_SPEED),
+        "-a", str(ESPEAK_AMPLITUDE),
+        "-g", str(ESPEAK_WORD_GAP_MS),
+        text,
+    ]
+
+    try:
+        current_voice_process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return True
+    except OSError as exc:
+        print(f"TTS subprocess failed: {exc}")
+
+    # Shell fallback (works on many Pi setups when Popen has PATH issues)
+    try:
+        safe_text = text.replace('"', "'")
+        cmd = (
+            f'{tts_executable} -s {ESPEAK_SPEED} -a {ESPEAK_AMPLITUDE} '
+            f'-g {ESPEAK_WORD_GAP_MS} "{safe_text}" &'
+        )
+        subprocess.Popen(cmd, shell=True)
+        return True
+    except OSError as exc:
+        print(f"TTS shell fallback failed: {exc}")
+        return False
+
+
+def test_voice():
+    """Manual voice test — press T in the app."""
+    print("Testing voice...")
+    stop_current_voice()
+    global last_voice_time
+    last_voice_time = 0.0
+    if run_tts("Voice system ready"):
+        print("TTS command sent — you should hear: Voice system ready")
+    else:
+        print("TTS failed. Run: sudo apt install espeak-ng")
+        print("Then test: espeak-ng \"Voice test\"")
+        print("\a", end="", flush=True)
 
 
 def speak_warning(state, allow_voice):
@@ -759,25 +900,13 @@ def speak_warning(state, allow_voice):
         last_confirmed_warning = ""
 
     text = warning_to_speech(state)
-    print(f"VOICE [{ESPEAK_SPEED} wpm]: {text}")
+    print(f">>> SPEAKING [{ESPEAK_SPEED} wpm]: {text}")
 
-    if check_espeak():
-        try:
-            current_voice_process = subprocess.Popen(
-                [
-                    "espeak",
-                    "-s", str(ESPEAK_SPEED),
-                    "-a", str(ESPEAK_AMPLITUDE),
-                    "-g", str(ESPEAK_WORD_GAP_MS),
-                    text,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            print("\a", end="", flush=True)
-    else:
-        print("\a", end="", flush=True)
+    if run_tts(text):
+        return
+
+    print("WARNING: Could not run TTS — install espeak-ng")
+    print("\a", end="", flush=True)
 
 
 # =============================================================================
@@ -829,9 +958,11 @@ def occupied_color(hits):
 def warning_color(state):
     if "CHECKING" in state or "CLEARING" in state:
         return (160, 180, 200)
-    if "STOP" in state:
+    if "STOP" in state or "VERY CLOSE" in state:
         return COLOR_WARN_STOP
-    if "AHEAD" in state:
+    if "FRONT" in state or "AHEAD" in state:
+        return COLOR_WARN_FRONT
+    if "BEHIND" in state or "BACK" in state:
         return COLOR_WARN_FRONT
     if "LEFT" in state or "RIGHT" in state:
         return COLOR_WARN_SIDE
@@ -1006,11 +1137,13 @@ def draw_warning_zones(screen, sw, sh, state):
         pygame.draw.rect(surf, (*base_col, alpha), rect)
         pygame.draw.rect(surf, (*base_col, 120 if active else 40), rect, 1)
 
-    front_on = "AHEAD" in state or "STOP" in state
+    front_on = "FRONT" in state or "AHEAD" in state
+    back_on = "BEHIND" in state or "BACK" in state
     left_on = "LEFT" in state
     right_on = "RIGHT" in state
 
     zone_rect(0, -0.40, ALERT_DISTANCE_M, 0.80, (255, 220, 50), front_on)
+    zone_rect(-ALERT_DISTANCE_M, -0.40, ALERT_DISTANCE_M, 0.80, (255, 200, 80), back_on)
     zone_rect(-1.0, -3.0, 1.0, 2.7, (255, 150, 50), left_on)
     zone_rect(-1.0, 0.30, 1.0, 2.7, (255, 150, 50), right_on)
 
@@ -1026,8 +1159,8 @@ def draw_warning_zones(screen, sw, sh, state):
 
 
 def draw_distance_panel(screen, font, sw):
-    """Side panel: nearest distance left / front / right."""
-    pw, ph = 200, 110
+    """Side panel: nearest distance back / left / front / right."""
+    pw, ph = 200, 135
     px, py = sw - pw - 14, 60
     panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
     panel.fill((*COLOR_PANEL_BG, 210))
@@ -1035,6 +1168,7 @@ def draw_distance_panel(screen, font, sw):
     pygame.draw.rect(screen, (60, 90, 130), (px, py, pw, ph), 1)
 
     rows = [
+        ("BACK", nearest_back_m),
         ("LEFT", nearest_left_m),
         ("FRONT", nearest_front_m),
         ("RIGHT", nearest_right_m),
@@ -1082,7 +1216,7 @@ def draw_hud(screen, fonts, sw, sh, fps):
         screen.blit(fnt.render(line, True, COLOR_HUD), (12, y))
         y += fnt.get_height() + 2
 
-    controls = "Q=Quit C=Clear S=Save Space=Pause R=Rays G=Grid V=Voice M=View F=Full H=Help"
+    controls = "Q=Quit C=Clear S=Save Space=Pause R=Rays G=Grid V=Voice T=Test F=Full H=Help"
     screen.blit(small.render(controls, True, (110, 130, 155)), (12, sh - 22))
 
     draw_distance_panel(screen, small, sw)
@@ -1108,8 +1242,8 @@ def draw_help_panel(screen, font, sw, sh):
         "  Front / Left / Right zones",
         "",
         "M = cycle RAW / MAP / COMBINED view",
-        "Voice: 5 s gap, slow speech, 15 detections",
-        "V = toggle voice (espeak)",
+        "Voice: 5 s gap | T = test voice",
+        "V = toggle voice",
         "Not full SLAM — no pose tracking",
     ]
     y = 12
@@ -1173,6 +1307,8 @@ def main():
     print("NOT full SLAM — no odometry, IMU, or pose tracking.")
     print()
 
+    init_voice_system()
+
     connection = None
     if not SIMULATED_MODE:
         connection = open_serial_port(PORT, BAUD, TIMEOUT)
@@ -1192,6 +1328,12 @@ def main():
     fonts = (font_sm, font_md, font_lg)
 
     prev_voice_state = None
+    was_voice_confirmed = False
+
+    # Short delay then startup voice test (proves audio works)
+    if voice_enabled and check_tts():
+        pygame.time.wait(800)
+        test_voice()
 
     try:
         while running:
@@ -1222,6 +1364,8 @@ def main():
                     elif event.key == pygame.K_v:
                         voice_enabled = not voice_enabled
                         print(f"Voice {'ON' if voice_enabled else 'OFF'}")
+                    elif event.key == pygame.K_t:
+                        test_voice()
                     elif event.key == pygame.K_m:
                         view_mode = (view_mode + 1) % 3
                         names = ["RAW", "MAP", "COMBINED"]
@@ -1232,14 +1376,24 @@ def main():
             sw, sh = screen.get_size()
             update_alerts()
 
-            # Voice: only on confirmed state change, with 5 s minimum gap
-            if voice_confirmed or (warning_state == "CLEAR" and clear_streak >= ZONE_CLEAR_SCANS):
-                if warning_state != prev_voice_state:
+            # Speak when confirmation newly becomes True, or on confirmed state change
+            just_confirmed = voice_confirmed and not was_voice_confirmed
+            state_changed = warning_state != prev_voice_state
+            clear_ready = (
+                warning_state == "CLEAR"
+                and clear_streak >= ZONE_CLEAR_SCANS
+                and prev_voice_state not in (None, "CLEAR")
+            )
+
+            if voice_enabled and (just_confirmed or state_changed or clear_ready):
+                if voice_confirmed or clear_ready:
                     speak_warning(
                         warning_state,
-                        voice_confirmed or warning_state == "CLEAR",
+                        voice_confirmed or clear_ready,
                     )
                     prev_voice_state = warning_state
+
+            was_voice_confirmed = voice_confirmed
 
             with data_lock:
                 free_snap = dict(free_grid)
@@ -1270,7 +1424,9 @@ def main():
 
             # Direction labels
             fx, fy = world_to_screen(0.6, 0, sw, sh)
+            bx, by = world_to_screen(-0.6, 0, sw, sh)
             screen.blit(font_sm.render("FRONT", True, (180, 200, 220)), (fx - 20, fy - 20))
+            screen.blit(font_sm.render("BACK", True, (140, 160, 180)), (bx - 18, by - 10))
 
             draw_hud(screen, fonts, sw, sh, clock.get_fps())
 
