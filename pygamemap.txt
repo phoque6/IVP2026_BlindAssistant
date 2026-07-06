@@ -1,0 +1,32 @@
+Run on Pi 5
+sudo apt install python3-serial python3-numpy python3-pygame
+python3 d6_aa55_pygame_room_mapper.py
+Test without LiDAR: set SIMULATED_MODE = True at the top — renders a rectangular room with table/chair obstacles and a rotating sweep.
+
+Controls
+Key	Action
+Q / Esc
+Quit safely
+C
+Clear map
+S
+Save lidar_room_points.csv, lidar_room_occupancy.csv, lidar_room_map.png
+Space
+Pause / resume
+R
+Toggle scan rays
+G
+Toggle occupancy grid
+P
+Toggle raw points
+F
+Toggle fullscreen
+Navigation warnings (HUD)
+CLEAR (green)
+OBSTACLE AHEAD (yellow)
+OBSTACLE LEFT / RIGHT (orange)
+STOP: VERY CLOSE OBJECT (red)
+Warnings print to the terminal only when the state changes.
+
+Note
+This is a real-time 2D room mapper from the sensor’s current position — not full SLAM. True SLAM would need wheel encoders, IMU, pose estimation, and loop closure to merge scans while the robot moves.
