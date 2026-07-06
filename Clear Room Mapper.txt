@@ -1,0 +1,39 @@
+sudo apt install python3-serial python3-pygame python3-numpy espeak
+python3 d6_aa55_clear_room_mapper_blind_alert.py
+Test without LiDAR: SIMULATED_MODE = True
+
+Blind navigation alerts (within 1 m)
+CLEAR (green)
+OBSTACLE AHEAD WITHIN 1 METRE (yellow)
+OBSTACLE LEFT/RIGHT WITHIN 1 METRE (orange)
+OBSTACLES LEFT AND RIGHT WITHIN 1 METRE
+STOP! OBJECT VERY CLOSE (red, < 0.45 m)
+Voice via espeak (toggle with V). Distance panel shows LEFT / FRONT / RIGHT nearest objects.
+
+Controls
+Key	Action
+M
+Cycle RAW → MAP → COMBINED
+Q/Esc
+Quit
+C
+Clear map
+S
+Save CSV + PNG
+Space
+Pause
+R
+Toggle rays
+G
+Toggle grid
+V
+Toggle voice
+F
+Fullscreen
+H
+Help panel
+Saves (S key)
+clear_room_points.csv
+clear_room_occupancy.csv
+clear_room_map.png
+Use COMBINED mode (default) for the clearest room view — walls build up over a few seconds as the LiDAR scans.
