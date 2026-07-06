@@ -80,11 +80,12 @@ MAX_RANGE_CM = int(MAX_RANGE_M * 100)
 # ---------------------------------------------------------------------------
 GRID_RESOLUTION_M = 0.05
 GRID_SIZE_M = 12.0
-OCCUPIED_MIN_HITS = 2
-WALL_STRONG_HITS = 6
-FREE_MIN_HITS = 1
+OCCUPIED_MIN_HITS = 3          # raised — filters single-hit noise
+WALL_STRONG_HITS = 5
+FREE_MIN_HITS = 2
 MAX_POINTS = 12000
-RAY_DRAW_STEP = 4
+RAY_DRAW_STEP = 6
+POLAR_BIN_DEG = 1.0            # median distance per degree bin = smoother walls
 
 # ---------------------------------------------------------------------------
 # Blind navigation alerts
@@ -92,7 +93,11 @@ RAY_DRAW_STEP = 4
 ALERT_DISTANCE_M = 1.0
 VERY_CLOSE_DISTANCE_M = 0.45
 ENABLE_VOICE_ALERTS = True
-VOICE_COOLDOWN_SECONDS = 2.5
+VOICE_COOLDOWN_SECONDS = 3.0
+VOICE_MIN_DETECTIONS = 10      # speak only after 10 consecutive zone detections
+VERY_CLOSE_VOICE_MIN = 4       # faster voice for emergency stop (still not instant noise)
+MOVING_DISTANCE_M = 0.12       # metres — position shift = moving object
+MOVING_MIN_SCANS = 3           # scans needed to confirm movement
 
 # ---------------------------------------------------------------------------
 # Save filenames
@@ -152,8 +157,14 @@ show_rays = True
 show_grid_map = True
 show_help = False
 fullscreen = False
-view_mode = VIEW_COMBINED
+view_mode = VIEW_MAP           # MAP view is clearest for room outline
 voice_enabled = ENABLE_VOICE_ALERTS
+
+# Voice confirmation tracking (reduces false spoken alerts)
+zone_streak = {"FRONT": 0, "LEFT": 0, "RIGHT": 0, "BOTH": 0, "VERY_CLOSE": 0}
+zone_position_history = {"FRONT": [], "LEFT": [], "RIGHT": [], "BOTH": []}
+voice_confirmed = False        # True when voice is allowed to speak current warning
+display_warning_state = "CLEAR"
 
 ser = None
 
@@ -327,10 +338,30 @@ def carve_ray_to_obstacle(x_m, y_m):
             free_grid[key] = free_grid.get(key, 0) + 1
 
 
+def smooth_scan_polar(scan_polar):
+    """
+    Bin scan points by angle and use median distance per bin.
+    This removes jitter so walls draw as clean straight segments.
+    """
+    bins = {}
+    for angle_deg, distance_cm in scan_polar:
+        bin_key = int(round(angle_deg / POLAR_BIN_DEG))
+        bins.setdefault(bin_key, []).append(distance_cm)
+
+    smoothed = []
+    for bin_key, distances in bins.items():
+        distances.sort()
+        median_cm = distances[len(distances) // 2]
+        angle_deg = (bin_key * POLAR_BIN_DEG) % 360.0
+        smoothed.append((angle_deg, median_cm))
+    return smoothed
+
+
 def process_scan(scan_polar):
     """Add scan to point cloud and update free/occupied grids."""
     global packet_count, latest_angle_deg, latest_scan_points
 
+    scan_polar = smooth_scan_polar(scan_polar)
     now = time.time()
     batch = []
 
@@ -353,6 +384,7 @@ def process_scan(scan_polar):
 def clear_map():
     global points_xy, free_grid, occupied_grid, latest_scan_points
     global packet_count, warning_state, nearest_left_m, nearest_front_m, nearest_right_m
+    global zone_streak, zone_position_history, voice_confirmed, display_warning_state
     with data_lock:
         points_xy = []
         free_grid = {}
@@ -360,7 +392,13 @@ def clear_map():
         latest_scan_points = []
         packet_count = 0
         warning_state = "CLEAR"
+        display_warning_state = "CLEAR"
         nearest_left_m = nearest_front_m = nearest_right_m = None
+        for key in zone_streak:
+            zone_streak[key] = 0
+        for key in zone_position_history:
+            zone_position_history[key] = []
+        voice_confirmed = False
     print("Map cleared.")
 
 
@@ -504,8 +542,106 @@ def compute_direction_distances(latest_points):
     return left_d, front_d, right_d
 
 
+def state_to_zone_key(state):
+    if "STOP" in state or "VERY CLOSE" in state:
+        return "VERY_CLOSE"
+    if "LEFT AND RIGHT" in state:
+        return "BOTH"
+    if "LEFT" in state:
+        return "LEFT"
+    if "RIGHT" in state:
+        return "RIGHT"
+    if "AHEAD" in state:
+        return "FRONT"
+    return None
+
+
+def points_in_zone(zone, points):
+    """Return points inside a warning zone."""
+    matched = []
+    for x_m, y_m, distance_m, _a in points:
+        if zone == "VERY_CLOSE" and distance_m <= VERY_CLOSE_DISTANCE_M:
+            matched.append((x_m, y_m, distance_m))
+        elif zone == "FRONT" and x_m > 0 and abs(y_m) <= 0.40 and distance_m <= ALERT_DISTANCE_M:
+            matched.append((x_m, y_m, distance_m))
+        elif zone == "LEFT" and y_m < -0.30 and abs(x_m) <= 1.0 and distance_m <= ALERT_DISTANCE_M:
+            matched.append((x_m, y_m, distance_m))
+        elif zone == "RIGHT" and y_m > 0.30 and abs(x_m) <= 1.0 and distance_m <= ALERT_DISTANCE_M:
+            matched.append((x_m, y_m, distance_m))
+        elif zone == "BOTH":
+            if (y_m < -0.30 or y_m > 0.30) and abs(x_m) <= 1.0 and distance_m <= ALERT_DISTANCE_M:
+                matched.append((x_m, y_m, distance_m))
+    return matched
+
+
+def detect_moving_in_zone(zone, points):
+    """
+    Detect if obstacle position is shifting between scans (moving object).
+    Moving objects may trigger voice sooner than VOICE_MIN_DETECTIONS.
+    """
+    matched = points_in_zone(zone, points)
+    if len(matched) < 2:
+        return False
+
+    cx = sum(p[0] for p in matched) / len(matched)
+    cy = sum(p[1] for p in matched) / len(matched)
+    now = time.time()
+
+    history = zone_position_history.setdefault(zone, [])
+    history.append((now, cx, cy))
+    # Keep last 2 seconds of samples
+    zone_position_history[zone] = [(t, x, y) for t, x, y in history if now - t < 2.0]
+
+    if len(zone_position_history[zone]) < MOVING_MIN_SCANS:
+        return False
+
+    old_t, old_x, old_y = zone_position_history[zone][0]
+    shift = math.hypot(cx - old_x, cy - old_y)
+    return shift >= MOVING_DISTANCE_M
+
+
+def update_voice_confirmation(raw_state, latest_points):
+    """
+    Voice speaks only when:
+      - obstacle detected in zone >= VOICE_MIN_DETECTIONS consecutive scans, OR
+      - a moving object is detected in that zone.
+    CLEAR always allowed immediately when zone becomes clear.
+    """
+    global voice_confirmed, display_warning_state, zone_streak
+
+    if raw_state == "CLEAR":
+        for key in zone_streak:
+            zone_streak[key] = 0
+        voice_confirmed = True
+        display_warning_state = "CLEAR"
+        return
+
+    zone = state_to_zone_key(raw_state)
+    if zone is None:
+        voice_confirmed = False
+        display_warning_state = raw_state
+        return
+
+    # Reset streaks for zones not currently triggered
+    for key in zone_streak:
+        if key != zone:
+            zone_streak[key] = 0
+    zone_streak[zone] = zone_streak.get(zone, 0) + 1
+
+    moving = detect_moving_in_zone(zone, latest_points)
+    needed = VERY_CLOSE_VOICE_MIN if zone == "VERY_CLOSE" else VOICE_MIN_DETECTIONS
+    confirmed = zone_streak[zone] >= needed or moving
+    voice_confirmed = confirmed
+
+    if confirmed:
+        display_warning_state = raw_state
+    else:
+        count = zone_streak[zone]
+        display_warning_state = f"CHECKING... {raw_state} ({count}/{needed})"
+
+
 def update_alerts():
-    """Update warning state and nearest direction distances."""
+    """Update warning state, voice confirmation, and direction distances."""
     global warning_state, warning_direction, nearest_distance_m
     global nearest_left_m, nearest_front_m, nearest_right_m
 
@@ -521,6 +657,8 @@ def update_alerts():
     nearest_left_m = left_d
     nearest_front_m = front_d
     nearest_right_m = right_d
+
+    update_voice_confirmation(state, latest)
 
 
 # =============================================================================
@@ -552,23 +690,24 @@ def warning_to_speech(state):
     return mapping.get(state, state)
 
 
-def speak_warning(state):
-    """Speak alert on state change with cooldown."""
+def speak_warning(state, allow_voice):
+    """Speak alert only when voice_confirmed (persistent or moving obstacle)."""
     global last_spoken_warning, last_voice_time
 
     if not voice_enabled:
         return
+    if not allow_voice and state != "CLEAR":
+        return
+
     now = time.time()
     if state == last_spoken_warning and now - last_voice_time < VOICE_COOLDOWN_SECONDS:
         return
-    if now - last_voice_time < VOICE_COOLDOWN_SECONDS and state != last_spoken_warning:
-        pass  # allow immediate speak on state change
 
     if state != last_spoken_warning or now - last_voice_time >= VOICE_COOLDOWN_SECONDS:
         last_spoken_warning = state
         last_voice_time = now
         text = warning_to_speech(state)
-        print(f"ALERT: {text}")
+        print(f"VOICE: {text}")
 
         if check_espeak():
             try:
@@ -629,6 +768,8 @@ def occupied_color(hits):
 
 
 def warning_color(state):
+    if "CHECKING" in state:
+        return (160, 180, 200)
     if "STOP" in state:
         return COLOR_WARN_STOP
     if "AHEAD" in state:
@@ -665,8 +806,9 @@ def draw_range_rings(screen, sw, sh, font):
 
 
 def draw_free_cells(screen, sw, sh, grid_free, grid_occ):
-    """Draw explored free-space cells as dark blue/grey squares."""
-    cell_px = max(2, int(GRID_RESOLUTION_M * PIXELS_PER_METER))
+    """Draw explored free floor — larger, softer fill for readable room interior."""
+    cell_px = max(3, int(GRID_RESOLUTION_M * PIXELS_PER_METER) + 1)
+    layer = pygame.Surface((sw, sh), pygame.SRCALPHA)
     for (ix, iy), count in grid_free.items():
         if count < FREE_MIN_HITS:
             continue
@@ -674,37 +816,80 @@ def draw_free_cells(screen, sw, sh, grid_free, grid_occ):
             continue
         x_m, y_m = grid_to_world(ix, iy)
         sx, sy = world_to_screen(x_m, y_m, sw, sh)
-        bright = min(count, 6)
-        shade = COLOR_FREE_BRIGHT if bright > 2 else COLOR_FREE
+        alpha = min(90, 35 + count * 8)
+        shade = COLOR_FREE_BRIGHT if count >= 4 else COLOR_FREE
         rect = pygame.Rect(sx - cell_px // 2, sy - cell_px // 2, cell_px, cell_px)
-        pygame.draw.rect(screen, shade, rect)
+        pygame.draw.rect(layer, (*shade, alpha), rect)
+    screen.blit(layer, (0, 0))
 
 
 def draw_occupied_cells(screen, sw, sh, grid_occ):
-    """Draw wall/obstacle cells with thickening for strong hits."""
-    cell_px = max(3, int(GRID_RESOLUTION_M * PIXELS_PER_METER))
+    """Draw walls as thick bright blocks with neighbour fill."""
+    cell_px = max(4, int(GRID_RESOLUTION_M * PIXELS_PER_METER) + 2)
+    wall_layer = pygame.Surface((sw, sh), pygame.SRCALPHA)
+
+    strong_cells = {k for k, v in grid_occ.items() if v >= WALL_STRONG_HITS}
+    drawn = set()
+
     for (ix, iy), hits in grid_occ.items():
         if hits < OCCUPIED_MIN_HITS:
             continue
+        colour = occupied_color(hits)
         x_m, y_m = grid_to_world(ix, iy)
         sx, sy = world_to_screen(x_m, y_m, sw, sh)
-        colour = occupied_color(hits)
 
         if hits >= WALL_STRONG_HITS:
-            size = max(5, cell_px + 2)
-            rect = pygame.Rect(sx - size // 2, sy - size // 2, size, size)
-            pygame.draw.rect(screen, colour, rect)
-            # Neighbour thickening for continuous walls
-            for dix, diy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                nx, ny = ix + dix, iy + diy
-                if grid_occ.get((nx, ny), 0) >= OCCUPIED_MIN_HITS:
-                    nwx, nwy = grid_to_world(nx, ny)
-                    nsx, nsy = world_to_screen(nwx, nwy, sw, sh)
-                    pygame.draw.circle(screen, colour, (nsx, nsy), 2)
-            pygame.draw.rect(screen, (255, 255, 255), rect, 1)
+            size = cell_px + 3
         else:
-            rect = pygame.Rect(sx - cell_px // 2, sy - cell_px // 2, cell_px, cell_px)
-            pygame.draw.rect(screen, colour, rect)
+            size = cell_px
+
+        rect = pygame.Rect(sx - size // 2, sy - size // 2, size, size)
+        pygame.draw.rect(wall_layer, (*colour, 220), rect)
+        drawn.add((ix, iy))
+
+        # Fill gaps between neighbouring wall cells
+        if hits >= WALL_STRONG_HITS:
+            for dix, diy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+                nk = (ix + dix, iy + diy)
+                if nk in strong_cells or grid_occ.get(nk, 0) >= OCCUPIED_MIN_HITS:
+                    nx, ny = grid_to_world(nk[0], nk[1])
+                    nsx, nsy = world_to_screen(nx, ny, sw, sh)
+                    pygame.draw.line(wall_layer, (*colour, 180), (sx, sy), (nsx, nsy), 3)
+
+    screen.blit(wall_layer, (0, 0))
+
+    # Bright white outline on confirmed walls
+    for (ix, iy) in strong_cells:
+        x_m, y_m = grid_to_world(ix, iy)
+        sx, sy = world_to_screen(x_m, y_m, sw, sh)
+        size = cell_px + 3
+        rect = pygame.Rect(sx - size // 2, sy - size // 2, size, size)
+        pygame.draw.rect(screen, (220, 255, 230), rect, 1)
+
+
+def draw_wall_outline_ring(screen, sw, sh, grid_occ):
+    """
+    Connect strong wall cells into a visible room outline polygon.
+    Makes the room shape easier to understand at a glance.
+    """
+    cell_px = max(4, int(GRID_RESOLUTION_M * PIXELS_PER_METER) + 2)
+    strong = [(ix, iy) for (ix, iy), h in grid_occ.items() if h >= WALL_STRONG_HITS]
+    if len(strong) < 8:
+        return
+
+    # Convert to screen points and draw segments between close neighbours
+    screen_pts = []
+    for ix, iy in strong:
+        x_m, y_m = grid_to_world(ix, iy)
+        screen_pts.append(world_to_screen(x_m, y_m, sw, sh))
+
+    outline_layer = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    for i, p1 in enumerate(screen_pts):
+        for p2 in screen_pts[i + 1:]:
+            dist = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+            if 2 < dist < cell_px * 3.5:
+                pygame.draw.line(outline_layer, (180, 255, 200, 140), p1, p2, 2)
+    screen.blit(outline_layer, (0, 0))
 
 
 def draw_scan_rays(screen, sw, sh, latest):
@@ -720,15 +905,19 @@ def draw_scan_rays(screen, sw, sh, latest):
 
 
 def draw_latest_points(screen, sw, sh, latest):
+    """Highlight only the current scan — small markers, not a noisy cloud."""
     for x_m, y_m, dist_m, _a in latest:
         sx, sy = world_to_screen(x_m, y_m, sw, sh)
         if dist_m <= VERY_CLOSE_DISTANCE_M:
             col = (255, 80, 80)
+            radius = 4
         elif dist_m <= ALERT_DISTANCE_M:
             col = (255, 200, 80)
+            radius = 3
         else:
-            col = COLOR_SCAN_POINT
-        pygame.draw.circle(screen, col, (sx, sy), 3)
+            col = (80, 200, 220)
+            radius = 2
+        pygame.draw.circle(screen, col, (sx, sy), radius, 1)
 
 
 def draw_raw_points(screen, sw, sh, points):
@@ -804,10 +993,10 @@ def draw_distance_panel(screen, font, sw):
 
 def draw_hud(screen, fonts, sw, sh, fps):
     small, med, large = fonts
-    warn_col = warning_color(warning_state)
+    warn_col = warning_color(display_warning_state)
 
     # Large warning banner top centre
-    banner = large.render(warning_state, True, warn_col)
+    banner = large.render(display_warning_state, True, warn_col)
     bx = (sw - banner.get_width()) // 2
     screen.blit(banner, (bx, 8))
 
@@ -823,7 +1012,9 @@ def draw_hud(screen, fonts, sw, sh, fps):
         "D6 AA55 Clear Room Mapper",
         f"{PORT if not SIMULATED_MODE else 'SIM'} @ {BAUD}  |  {mode_names[view_mode]}",
         f"Points:{n_pts}  Free:{n_free}  Walls:{n_occ}  Pkts:{n_pkt}  FPS:{fps:.0f}",
-        f"Voice:{'ON' if voice_enabled else 'OFF'}  Rays:{'ON' if show_rays else 'OFF'}  "
+        f"Voice:{'ON' if voice_enabled else 'OFF'}  "
+        f"Confirm:{'YES' if voice_confirmed else 'NO'}  "
+        f"Rays:{'ON' if show_rays else 'OFF'}  "
         f"Grid:{'ON' if show_grid_map else 'OFF'}  {'PAUSED' if mapping_paused else 'LIVE'}",
     ]
     y = 42
@@ -858,6 +1049,7 @@ def draw_help_panel(screen, font, sw, sh):
         "  Front / Left / Right zones",
         "",
         "M = cycle RAW / MAP / COMBINED view",
+        "Voice needs 10 detections or moving object",
         "V = toggle voice (espeak)",
         "Not full SLAM — no pose tracking",
     ]
@@ -940,7 +1132,7 @@ def main():
     font_ring = pygame.font.SysFont("monospace", 11)
     fonts = (font_sm, font_md, font_lg)
 
-    prev_warning = ""
+    prev_voice_state = ""
 
     try:
         while running:
@@ -981,9 +1173,10 @@ def main():
             sw, sh = screen.get_size()
             update_alerts()
 
-            if warning_state != prev_warning:
-                speak_warning(warning_state)
-                prev_warning = warning_state
+            # Voice only when confirmed (10+ scans, moving object, or CLEAR)
+            if (voice_confirmed or warning_state == "CLEAR") and warning_state != prev_voice_state:
+                speak_warning(warning_state, voice_confirmed or warning_state == "CLEAR")
+                prev_voice_state = warning_state
 
             with data_lock:
                 free_snap = dict(free_grid)
@@ -1001,14 +1194,15 @@ def main():
             if show_grid_map and view_mode in (VIEW_MAP, VIEW_COMBINED):
                 draw_free_cells(screen, sw, sh, free_snap, occ_snap)
                 draw_occupied_cells(screen, sw, sh, occ_snap)
+                draw_wall_outline_ring(screen, sw, sh, occ_snap)
 
-            if show_rays and latest:
+            if show_rays and latest and view_mode != VIEW_MAP:
                 draw_scan_rays(screen, sw, sh, latest)
 
-            if view_mode in (VIEW_COMBINED, VIEW_RAW):
+            if view_mode == VIEW_COMBINED:
                 draw_latest_points(screen, sw, sh, latest)
 
-            draw_warning_zones(screen, sw, sh, warning_state)
+            draw_warning_zones(screen, sw, sh, display_warning_state)
             draw_sensor(screen, sw, sh)
 
             # Direction labels
