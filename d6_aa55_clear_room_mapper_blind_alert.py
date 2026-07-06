@@ -93,11 +93,18 @@ POLAR_BIN_DEG = 1.0            # median distance per degree bin = smoother walls
 ALERT_DISTANCE_M = 1.0
 VERY_CLOSE_DISTANCE_M = 0.45
 ENABLE_VOICE_ALERTS = True
-VOICE_COOLDOWN_SECONDS = 3.0
-VOICE_MIN_DETECTIONS = 10      # speak only after 10 consecutive zone detections
-VERY_CLOSE_VOICE_MIN = 4       # faster voice for emergency stop (still not instant noise)
-MOVING_DISTANCE_M = 0.12       # metres — position shift = moving object
-MOVING_MIN_SCANS = 3           # scans needed to confirm movement
+VOICE_COOLDOWN_SECONDS = 5.0   # minimum gap between ANY spoken messages
+VOICE_REPEAT_SECONDS = 12.0    # re-announce same danger only after this long (if still present)
+VOICE_MIN_DETECTIONS = 15      # ~15 consecutive scans before speaking (reduces false alarms)
+VERY_CLOSE_VOICE_MIN = 8       # emergency stop — still faster than normal, but not instant chatter
+ZONE_CLEAR_SCANS = 4           # need several clear scans before resetting detection streak
+MOVING_DISTANCE_M = 0.15       # metres shift to count as moving object
+MOVING_MIN_SCANS = 5           # scans needed to confirm movement for early voice
+
+# espeak: speed (words/min, default ~175), amplitude (0-200), gap between words (ms)
+ESPEAK_SPEED = 115             # slower = easier to understand
+ESPEAK_AMPLITUDE = 200
+ESPEAK_WORD_GAP_MS = 12
 
 # ---------------------------------------------------------------------------
 # Save filenames
@@ -150,6 +157,9 @@ nearest_right_m = None
 
 last_spoken_warning = ""
 last_voice_time = 0.0
+last_confirmed_warning = ""
+clear_streak = 0
+current_voice_process = None
 espeak_available = None
 
 # Display toggles
@@ -385,6 +395,7 @@ def clear_map():
     global points_xy, free_grid, occupied_grid, latest_scan_points
     global packet_count, warning_state, nearest_left_m, nearest_front_m, nearest_right_m
     global zone_streak, zone_position_history, voice_confirmed, display_warning_state
+    global clear_streak, last_confirmed_warning, current_voice_process
     with data_lock:
         points_xy = []
         free_grid = {}
@@ -399,6 +410,9 @@ def clear_map():
         for key in zone_position_history:
             zone_position_history[key] = []
         voice_confirmed = False
+        clear_streak = 0
+        last_confirmed_warning = ""
+    stop_current_voice()
     print("Map cleared.")
 
 
@@ -604,25 +618,30 @@ def update_voice_confirmation(raw_state, latest_points):
     """
     Voice speaks only when:
       - obstacle detected in zone >= VOICE_MIN_DETECTIONS consecutive scans, OR
-      - a moving object is detected in that zone.
-    CLEAR always allowed immediately when zone becomes clear.
+      - a moving object is detected (with at least 5 scans in zone).
+    CLEAR requires ZONE_CLEAR_SCANS consecutive clear scans to avoid flicker.
     """
-    global voice_confirmed, display_warning_state, zone_streak
+    global voice_confirmed, display_warning_state, zone_streak, clear_streak
 
     if raw_state == "CLEAR":
-        for key in zone_streak:
-            zone_streak[key] = 0
-        voice_confirmed = True
-        display_warning_state = "CLEAR"
+        clear_streak += 1
+        if clear_streak >= ZONE_CLEAR_SCANS:
+            for key in zone_streak:
+                zone_streak[key] = 0
+            voice_confirmed = True
+            display_warning_state = "CLEAR"
+        else:
+            voice_confirmed = False
+            display_warning_state = f"CLEARING... ({clear_streak}/{ZONE_CLEAR_SCANS})"
         return
 
+    clear_streak = 0
     zone = state_to_zone_key(raw_state)
     if zone is None:
         voice_confirmed = False
         display_warning_state = raw_state
         return
 
-    # Reset streaks for zones not currently triggered
     for key in zone_streak:
         if key != zone:
             zone_streak[key] = 0
@@ -630,7 +649,7 @@ def update_voice_confirmation(raw_state, latest_points):
 
     moving = detect_moving_in_zone(zone, latest_points)
     needed = VERY_CLOSE_VOICE_MIN if zone == "VERY_CLOSE" else VOICE_MIN_DETECTIONS
-    confirmed = zone_streak[zone] >= needed or moving
+    confirmed = zone_streak[zone] >= needed or (moving and zone_streak[zone] >= 5)
     voice_confirmed = confirmed
 
     if confirmed:
@@ -679,20 +698,36 @@ def check_espeak():
 
 
 def warning_to_speech(state):
+    """Short, clear phrases — easier to hear at slow speed."""
     mapping = {
-        "CLEAR": "Clear",
-        "OBSTACLE AHEAD WITHIN 1 METRE": "Obstacle ahead within one metre",
-        "OBSTACLE LEFT WITHIN 1 METRE": "Obstacle on your left within one metre",
-        "OBSTACLE RIGHT WITHIN 1 METRE": "Obstacle on your right within one metre",
-        "OBSTACLES LEFT AND RIGHT WITHIN 1 METRE": "Obstacles on left and right",
+        "CLEAR": "Path clear",
+        "OBSTACLE AHEAD WITHIN 1 METRE": "Obstacle ahead",
+        "OBSTACLE LEFT WITHIN 1 METRE": "Obstacle on left",
+        "OBSTACLE RIGHT WITHIN 1 METRE": "Obstacle on right",
+        "OBSTACLES LEFT AND RIGHT WITHIN 1 METRE": "Obstacles left and right",
         "STOP! OBJECT VERY CLOSE": "Stop. Object very close",
     }
     return mapping.get(state, state)
 
 
+def stop_current_voice():
+    """Stop any speech still playing so messages do not overlap."""
+    global current_voice_process
+    if current_voice_process is not None and current_voice_process.poll() is None:
+        try:
+            current_voice_process.terminate()
+            current_voice_process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    current_voice_process = None
+
+
 def speak_warning(state, allow_voice):
-    """Speak alert only when voice_confirmed (persistent or moving obstacle)."""
-    global last_spoken_warning, last_voice_time
+    """
+    Speak one clear alert with slow espeak and a minimum 5 second gap.
+    Same warning will not repeat until VOICE_REPEAT_SECONDS unless state changes.
+    """
+    global last_spoken_warning, last_voice_time, last_confirmed_warning, current_voice_process
 
     if not voice_enabled:
         return
@@ -700,25 +735,49 @@ def speak_warning(state, allow_voice):
         return
 
     now = time.time()
-    if state == last_spoken_warning and now - last_voice_time < VOICE_COOLDOWN_SECONDS:
+    elapsed = now - last_voice_time
+
+    # Always wait at least VOICE_COOLDOWN_SECONDS between any two messages
+    if elapsed < VOICE_COOLDOWN_SECONDS:
         return
 
-    if state != last_spoken_warning or now - last_voice_time >= VOICE_COOLDOWN_SECONDS:
-        last_spoken_warning = state
-        last_voice_time = now
-        text = warning_to_speech(state)
-        print(f"VOICE: {text}")
+    # Same message: only repeat after VOICE_REPEAT_SECONDS (avoid fast loops)
+    if state == last_spoken_warning and elapsed < VOICE_REPEAT_SECONDS:
+        return
 
-        if check_espeak():
-            try:
-                subprocess.Popen(
-                    ["espeak", text],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except OSError:
-                print("\a", end="", flush=True)
-        else:
+    # Do not speak CLEAR unless we previously announced a real danger
+    if state == "CLEAR" and last_confirmed_warning == "":
+        return
+
+    stop_current_voice()
+
+    last_spoken_warning = state
+    last_voice_time = now
+    if state != "CLEAR":
+        last_confirmed_warning = state
+    else:
+        last_confirmed_warning = ""
+
+    text = warning_to_speech(state)
+    print(f"VOICE [{ESPEAK_SPEED} wpm]: {text}")
+
+    if check_espeak():
+        try:
+            current_voice_process = subprocess.Popen(
+                [
+                    "espeak",
+                    "-s", str(ESPEAK_SPEED),
+                    "-a", str(ESPEAK_AMPLITUDE),
+                    "-g", str(ESPEAK_WORD_GAP_MS),
+                    text,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
             print("\a", end="", flush=True)
+    else:
+        print("\a", end="", flush=True)
 
 
 # =============================================================================
@@ -768,7 +827,7 @@ def occupied_color(hits):
 
 
 def warning_color(state):
-    if "CHECKING" in state:
+    if "CHECKING" in state or "CLEARING" in state:
         return (160, 180, 200)
     if "STOP" in state:
         return COLOR_WARN_STOP
@@ -1049,7 +1108,7 @@ def draw_help_panel(screen, font, sw, sh):
         "  Front / Left / Right zones",
         "",
         "M = cycle RAW / MAP / COMBINED view",
-        "Voice needs 10 detections or moving object",
+        "Voice: 5 s gap, slow speech, 15 detections",
         "V = toggle voice (espeak)",
         "Not full SLAM — no pose tracking",
     ]
@@ -1132,7 +1191,7 @@ def main():
     font_ring = pygame.font.SysFont("monospace", 11)
     fonts = (font_sm, font_md, font_lg)
 
-    prev_voice_state = ""
+    prev_voice_state = None
 
     try:
         while running:
@@ -1173,10 +1232,14 @@ def main():
             sw, sh = screen.get_size()
             update_alerts()
 
-            # Voice only when confirmed (10+ scans, moving object, or CLEAR)
-            if (voice_confirmed or warning_state == "CLEAR") and warning_state != prev_voice_state:
-                speak_warning(warning_state, voice_confirmed or warning_state == "CLEAR")
-                prev_voice_state = warning_state
+            # Voice: only on confirmed state change, with 5 s minimum gap
+            if voice_confirmed or (warning_state == "CLEAR" and clear_streak >= ZONE_CLEAR_SCANS):
+                if warning_state != prev_voice_state:
+                    speak_warning(
+                        warning_state,
+                        voice_confirmed or warning_state == "CLEAR",
+                    )
+                    prev_voice_state = warning_state
 
             with data_lock:
                 free_snap = dict(free_grid)
@@ -1222,6 +1285,7 @@ def main():
         if connection and connection.is_open:
             connection.close()
             print("Serial closed.")
+        stop_current_voice()
         pygame.quit()
         print("Stopped safely.")
 
