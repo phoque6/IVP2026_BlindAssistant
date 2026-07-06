@@ -695,8 +695,9 @@ def draw_raw_points(screen, sw, sh, points, now):
         pygame.draw.circle(screen, colour, (sx, sy), 2)
 
 
-def draw_hud(screen, font, small_font, sw, stats, fps):
+def draw_hud(screen, font, small_font, stats, fps):
     """Draw status overlay text."""
+    sw, sh = screen.get_size()
     warning = stats["warning"]
     w_color = warning_color(warning)
     closest = stats["closest"]
@@ -848,7 +849,7 @@ def main():
                 "paused": paused,
             }
             fps = clock.get_fps()
-            draw_hud(screen, font, small_font, sw, stats, fps)
+            draw_hud(screen, font, small_font, stats, fps)
 
             pygame.display.flip()
             clock.tick(FPS_TARGET)
