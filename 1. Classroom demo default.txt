@@ -1,0 +1,34 @@
+1. Classroom demo default
+SIMULATED_MODE = True   # True = classroom demo without LiDAR; False = real serial LiDAR
+Runs out of the box without LiDAR. For real hardware, set:
+
+SIMULATED_MODE = False
+2. Pi Camera + USB webcam support
+New settings at the top of the file:
+
+CAMERA_BACKEND = "auto"   # "auto" | "picamera2" | "usb" | "none"
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+Camera init order (auto):
+
+Raspberry Pi Camera via picamera2 (preferred on Pi 5)
+USB webcam via OpenCV VideoCapture
+Simulated optical flow if neither is available
+The header HUD now shows:
+
+Cam:PI-CAM — Pi Camera active
+Cam:USB — USB webcam active
+Cam:SIM — simulated panel
+Install on Raspberry Pi
+sudo apt update
+sudo apt install python3-serial python3-pygame python3-opencv python3-numpy espeak-ng python3-picamera2
+python3 team_bravo_multisensor_dashboard.py
+Force a specific camera
+Setting	Use case
+CAMERA_BACKEND = "picamera2"
+Pi Camera module only
+CAMERA_BACKEND = "usb"
+USB webcam only
+CAMERA_BACKEND = "none"
+Always simulated optical flow
+Shutdown now calls release_camera() so both picamera2 and USB are released cleanly.
