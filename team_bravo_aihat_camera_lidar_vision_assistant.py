@@ -418,12 +418,12 @@ def process_scan(scan_polar: List[Tuple[float, float]]) -> None:
     smoothed = smooth_scan_polar(scan_polar)
     xy_points = []
     ts = round(time.time(), 3)
-    for a, d_cm in smoothed:
-        x, y, d_m, a_deg = polar_to_xy(a, d_cm)
-        xy_points.append((x, y, d_m, a_deg))
-        carve_ray_to_obstacle(x, y)
-        lidar_log_rows.append([ts, f"{a_deg:.2f}", f"{d_cm:.2f}", f"{x:.3f}", f"{y:.3f}", f"{d_m:.3f}"])
     with data_lock:
+        for a, d_cm in smoothed:
+            x, y, d_m, a_deg = polar_to_xy(a, d_cm)
+            xy_points.append((x, y, d_m, a_deg))
+            carve_ray_to_obstacle(x, y)
+            lidar_log_rows.append([ts, f"{a_deg:.2f}", f"{d_cm:.2f}", f"{x:.3f}", f"{y:.3f}", f"{d_m:.3f}"])
         latest_polar_points = smoothed
         latest_scan_points = xy_points
 
@@ -1128,13 +1128,16 @@ def draw_panel_frame(screen: pygame.Surface, rect: pygame.Rect, title: str) -> p
     return pygame.Rect(rect.x + 4, rect.y + 24, rect.width - 8, rect.height - 28)
 
 
-def draw_ai_camera_panel(screen: pygame.Surface, rect: pygame.Rect) -> None:
-    with camera_lock:
-        frame = latest_camera_rgb.copy() if latest_camera_rgb is not None else None
-        dets = list(latest_camera_detections)
-        ocr_items = list(latest_ocr_results)
-    if frame is not None:
-        surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+def draw_ai_camera_panel(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    frame_snapshot: Optional[np.ndarray],
+    detections_snapshot: List[Detection],
+    ocr_snapshot: List[OCRResult],
+) -> None:
+    """Draw AI camera panel using pre-copied snapshots (no lock during draw)."""
+    if frame_snapshot is not None:
+        surf = pygame.surfarray.make_surface(frame_snapshot.swapaxes(0, 1))
         surf = pygame.transform.scale(surf, (rect.width, rect.height))
         screen.blit(surf, rect.topleft)
     else:
@@ -1150,10 +1153,10 @@ def draw_ai_camera_panel(screen: pygame.Surface, rect: pygame.Rect) -> None:
     y += 16
     screen.blit(font.render(last_camera_banner[:48], True, COLOR_TEXT), (rect.x + 6, y))
     y += 16
-    if ocr_items:
-        screen.blit(font.render(f"Sign: {ocr_items[0].text}", True, COLOR_YELLOW), (rect.x + 6, y))
+    if ocr_snapshot:
+        screen.blit(font.render(f"Sign: {ocr_snapshot[0].text}", True, COLOR_YELLOW), (rect.x + 6, y))
         y += 16
-    for d in dets[:3]:
+    for d in detections_snapshot[:3]:
         dist = f" {d.distance_m:.1f}m" if d.distance_m else ""
         screen.blit(font.render(f"{d.label}{dist} {int(d.confidence*100)}%", True, COLOR_GREEN), (rect.x + 6, y))
         y += 14
@@ -1210,13 +1213,16 @@ def world_to_panel(x_m: float, y_m: float, rect: pygame.Rect) -> Tuple[int, int]
     return sx, sy
 
 
-def draw_lidar_distance_panel(screen: pygame.Surface, rect: pygame.Rect) -> None:
-    with data_lock:
-        pts = list(latest_scan_points)
+def draw_lidar_distance_panel(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    latest_scan_snapshot: List[Tuple[float, float, float, float]],
+) -> None:
+    """LiDAR distance heatmap using a snapshot of the latest scan."""
     pygame.draw.circle(screen, (40, 46, 56), rect.center, min(rect.width, rect.height) // 2 - 4)
     for r in (0.5, 1.0, 1.5, 2.0):
         pygame.draw.circle(screen, (58, 68, 80), rect.center, int(r * pixels_per_meter), 1)
-    for x_m, y_m, d_m, _a in pts:
+    for x_m, y_m, d_m, _a in latest_scan_snapshot:
         px, py = world_to_panel(x_m, y_m, rect)
         if not rect.collidepoint(px, py):
             continue
@@ -1254,38 +1260,43 @@ def get_connected_wall_components(occupied_cells: List[Tuple[int, int]]) -> List
     return components
 
 
-def draw_local_room_map(screen: pygame.Surface, rect: pygame.Rect) -> None:
+def draw_local_room_map(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    free_grid_snapshot: Dict[Tuple[int, int], int],
+    occupied_grid_snapshot: Dict[Tuple[int, int], int],
+    latest_scan_snapshot: List[Tuple[float, float, float, float]],
+) -> None:
+    """Local map using snapshots — safe while LiDAR thread updates grids."""
     pygame.draw.rect(screen, (15, 20, 26), rect)
     for r in (1, 2, 3, 4, 5):
         pygame.draw.circle(screen, (35, 90, 150), rect.center, int(r * pixels_per_meter), 1)
     # Free cells
-    for (ix, iy), fh in free_grid.items():
-        if fh < FREE_MIN_HITS or occupied_grid.get((ix, iy), 0) >= OCCUPIED_MIN_HITS:
+    for (ix, iy), fh in free_grid_snapshot.items():
+        if fh < FREE_MIN_HITS or occupied_grid_snapshot.get((ix, iy), 0) >= OCCUPIED_MIN_HITS:
             continue
         px, py = world_to_panel(ix * GRID_RESOLUTION_M, iy * GRID_RESOLUTION_M, rect)
         if rect.collidepoint(px, py):
             pygame.draw.rect(screen, (28, 48, 82), pygame.Rect(px - 1, py - 1, 3, 3))
     # Weak occupied
-    for (ix, iy), hits in occupied_grid.items():
+    for (ix, iy), hits in occupied_grid_snapshot.items():
         if OCCUPIED_MIN_HITS <= hits < WALL_STRONG_HITS:
             px, py = world_to_panel(ix * GRID_RESOLUTION_M, iy * GRID_RESOLUTION_M, rect)
             if rect.collidepoint(px, py):
                 pygame.draw.rect(screen, (40, 160, 200), pygame.Rect(px - 1, py - 1, 3, 3))
     # Connected wall components
-    cells = [c for c, hits in occupied_grid.items() if hits >= OCCUPIED_MIN_HITS]
+    cells = [c for c, hits in occupied_grid_snapshot.items() if hits >= OCCUPIED_MIN_HITS]
     comps = get_connected_wall_components(cells)
     for comp in comps:
         for ix, iy in comp:
-            hits = occupied_grid.get((ix, iy), 0)
+            hits = occupied_grid_snapshot.get((ix, iy), 0)
             col = (140, 240, 180) if hits >= WALL_STRONG_HITS else (90, 220, 255)
             px, py = world_to_panel(ix * GRID_RESOLUTION_M, iy * GRID_RESOLUTION_M, rect)
             if rect.collidepoint(px, py):
                 size = 4 if hits >= WALL_STRONG_HITS else 3
                 pygame.draw.rect(screen, col, pygame.Rect(px - size // 2, py - size // 2, size, size))
     # Current scan
-    with data_lock:
-        pts = list(latest_scan_points)
-    for x_m, y_m, d_m, _a in pts:
+    for x_m, y_m, d_m, _a in latest_scan_snapshot:
         px, py = world_to_panel(x_m, y_m, rect)
         if rect.collidepoint(px, py):
             col = COLOR_RED if d_m <= VERY_CLOSE_DISTANCE_M else COLOR_YELLOW if d_m <= ALERT_DISTANCE_M else COLOR_CYAN
@@ -1322,7 +1333,12 @@ def draw_footer(screen: pygame.Surface) -> None:
     screen.blit(font.render(controls, True, COLOR_MUTED), (10, SCREEN_HEIGHT - 26))
 
 
-def draw_debug_panel(screen: pygame.Surface, fused_alert: str) -> None:
+def draw_debug_panel(
+    screen: pygame.Surface,
+    fused_alert: str,
+    detections_count: int,
+    scan_points_count: int,
+) -> None:
     if not debug_enabled:
         return
     rect = pygame.Rect(12, HEADER_HEIGHT + 10, 390, 190)
@@ -1336,7 +1352,7 @@ def draw_debug_panel(screen: pygame.Surface, fused_alert: str) -> None:
         f"model={AI_MODEL_PATH}",
         f"camera_fps={camera_fps:.1f} ai_fps={ai_inference_fps:.1f}",
         f"ocr_available={pytesseract is not None} ocr_text={last_ocr_text or '-'}",
-        f"detections={len(latest_camera_detections)} lidar_pkts={len(latest_scan_points)}",
+        f"detections={detections_count} lidar_pkts={scan_points_count}",
         f"lidar_raw={raw_lidar_alert} lidar_conf={confirmed_lidar_alert}",
         f"fused_alert={fused_alert} voice_last={last_spoken_alert}",
         f"zones F/L/R/B={last_zone_counts['front']}/{last_zone_counts['left']}/"
@@ -1357,9 +1373,12 @@ def save_dashboard_and_csv(screen: pygame.Surface) -> None:
     with open(OCCUPANCY_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["ix", "iy", "occupied_hits", "free_hits"])
-        keys = set(occupied_grid.keys()) | set(free_grid.keys())
+        with data_lock:
+            occ_snap = dict(occupied_grid)
+            free_snap = dict(free_grid)
+        keys = set(occ_snap.keys()) | set(free_snap.keys())
         for k in sorted(keys):
-            w.writerow([k[0], k[1], occupied_grid.get(k, 0), free_grid.get(k, 0)])
+            w.writerow([k[0], k[1], occ_snap.get(k, 0), free_snap.get(k, 0)])
     with open(CAMERA_DETECTIONS_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["timestamp", "label", "kind", "confidence", "distance_m", "x", "y", "w", "h", "source", "text"])
@@ -1435,6 +1454,20 @@ def main() -> None:
                     handle_keydown(event.key, screen)
 
             fused_alert = process_voice_alerts()
+
+            # Brief snapshots only — never hold locks while drawing
+            with data_lock:
+                free_grid_snapshot = dict(free_grid)
+                occupied_grid_snapshot = dict(occupied_grid)
+                latest_scan_snapshot = list(latest_scan_points)
+
+            with camera_lock:
+                camera_frame_snapshot = (
+                    latest_camera_rgb.copy() if latest_camera_rgb is not None else None
+                )
+                camera_dets_snapshot = list(latest_camera_detections)
+                ocr_snapshot = list(latest_ocr_results)
+
             screen.fill(COLOR_BG)
 
             p00 = panel_rect(0, 0)
@@ -1443,16 +1476,16 @@ def main() -> None:
             p11 = panel_rect(1, 1)
 
             r = draw_panel_frame(screen, p00, "AI Camera Detection + Sign Reading")
-            draw_ai_camera_panel(screen, r)
+            draw_ai_camera_panel(screen, r, camera_frame_snapshot, camera_dets_snapshot, ocr_snapshot)
 
             r = draw_panel_frame(screen, p10, "Obstacle Zones")
             draw_obstacle_zones(screen, r)
 
             r = draw_panel_frame(screen, p01, "LiDAR Distance View")
-            draw_lidar_distance_panel(screen, r)
+            draw_lidar_distance_panel(screen, r, latest_scan_snapshot)
 
             r = draw_panel_frame(screen, p11, "Local Room Map")
-            draw_local_room_map(screen, r)
+            draw_local_room_map(screen, r, free_grid_snapshot, occupied_grid_snapshot, latest_scan_snapshot)
 
             if zones_fullscreen:
                 full = pygame.Rect(8, HEADER_HEIGHT + 8, SCREEN_WIDTH - 16, SCREEN_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT - 16)
@@ -1463,7 +1496,7 @@ def main() -> None:
 
             draw_header(screen, fused_alert)
             draw_footer(screen)
-            draw_debug_panel(screen, fused_alert)
+            draw_debug_panel(screen, fused_alert, len(camera_dets_snapshot), len(latest_scan_snapshot))
             pygame.display.flip()
             clock.tick(FPS)
     finally:
