@@ -125,21 +125,25 @@ AI_PROCESS_HEIGHT = 312
 DNN_EVERY_N_FRAMES = 8
 
 # Time-based camera processing (decoupled from capture rate)
-OCR_INTERVAL_SECONDS = 5.0
+OCR_INTERVAL_SECONDS = 3.0
 OCR_VOICE_REPEAT_SECONDS = 5.0
 OCR_PERSIST_SECONDS = 8.0
-OCR_FRAME_SCALE = 1.5
+OCR_FRAME_SCALE = 2.0
 AI_DETECTION_INTERVAL_SECONDS = 0.5
 CAMERA_SLEEP_SECONDS = 0.001
 
 OCR_MIN_TEXT_LENGTH = 2
-OCR_MAX_TEXT_LENGTH = 20
+OCR_MAX_TEXT_LENGTH = 40
 OCR_WHOLE_FRAME_FALLBACK = False
-OCR_USE_SIGN_VOCABULARY = True
-OCR_MIN_CONFIDENCE_SCORE = 0.55
+# Vocabulary corrects common signs (EX1T->EXIT) but does NOT block unknown text
+OCR_USE_SIGN_VOCABULARY = False
+OCR_VOCABULARY_CORRECTION = True
+OCR_MIN_CONFIDENCE_SCORE = 0.38
 OCR_REQUIRE_STABLE_READS = 2
-OCR_STABLE_WINDOW_SECONDS = 10.0
-OCR_FUZZY_MATCH_THRESHOLD = 0.65
+OCR_MANUAL_CONFIRM_SCORE = 0.42
+OCR_AUTO_SINGLE_READ_SCORE = 0.72
+OCR_STABLE_WINDOW_SECONDS = 12.0
+OCR_FUZZY_MATCH_THRESHOLD = 0.55
 
 KNOWN_SIGN_WORDS = [
     "EXIT",
@@ -176,13 +180,13 @@ SIGN_REPEAT_SECONDS = 5.0
 CAMERA_OBJECT_CONFIRM_DETECTIONS = 10
 CAMERA_OBJECT_REPEAT_SECONDS = 10.0
 
-# LiDAR obstacle voice
-LIDAR_CONFIRM_SCANS = 10
+# LiDAR obstacle voice — confirm faster; do not clear on one CLEAR frame
+LIDAR_CONFIRM_SCANS = 4
 OBSTACLE_REPEAT_SECONDS = 10.0
 VERY_CLOSE_REPEAT_SECONDS = 5.0
 
-# Path clear voice
-CLEAR_CONFIRM_SCANS = 15
+# Path clear voice — require sustained clear before resetting obstacle alert
+CLEAR_CONFIRM_SCANS = 6
 CLEAR_REPEAT_SECONDS = 20.0
 
 ESPEAK_SPEED = 155
@@ -876,9 +880,7 @@ def pick_best_camera_object(
 def update_sign_voice_state_machine(ocr_raw_text: str) -> None:
     global sign_candidate_text, sign_candidate_count, confirmed_sign_text, last_ocr_text
     cleaned = match_known_sign_text(ocr_raw_text) or clean_ocr_text(ocr_raw_text)
-    if not cleaned or len(cleaned) < OCR_MIN_TEXT_LENGTH:
-        return
-    if len(cleaned) > OCR_MAX_TEXT_LENGTH and not is_known_sign_word(cleaned):
+    if not cleaned or not is_valid_sign_text(cleaned):
         return
     last_ocr_text = cleaned
     if cleaned == sign_candidate_text:
@@ -912,19 +914,51 @@ def update_object_voice_state_machine(detections: List[Detection], frame_w: int)
 
 
 def update_lidar_voice_state_machine(raw_alert: str) -> None:
+    """Confirm obstacles after several scans; only clear after sustained CLEAR."""
     global raw_lidar_alert, lidar_candidate_alert, lidar_candidate_count
     global confirmed_lidar_alert, lidar_clear_streak
     raw_lidar_alert = raw_alert
+
+    if raw_alert == "CLEAR":
+        lidar_clear_streak += 1
+        if lidar_clear_streak >= CLEAR_CONFIRM_SCANS:
+            if confirmed_lidar_alert != "CLEAR":
+                print("LiDAR path clear confirmed")
+            confirmed_lidar_alert = "CLEAR"
+            lidar_candidate_alert = "CLEAR"
+            lidar_candidate_count = 0
+        return
+
+    lidar_clear_streak = 0
     if raw_alert == lidar_candidate_alert:
         lidar_candidate_count += 1
     else:
         lidar_candidate_alert = raw_alert
         lidar_candidate_count = 1
+
     if lidar_candidate_count >= LIDAR_CONFIRM_SCANS:
+        if confirmed_lidar_alert != lidar_candidate_alert:
+            print(f"LiDAR obstacle confirmed: {lidar_candidate_alert}")
         confirmed_lidar_alert = lidar_candidate_alert
-    elif raw_alert == "CLEAR":
-        confirmed_lidar_alert = "CLEAR"
-    lidar_clear_streak = lidar_clear_streak + 1 if raw_alert == "CLEAR" else 0
+
+
+def confirm_sign_text(text: str, speak_now: bool = True) -> None:
+    """Mark sign as confirmed and optionally speak immediately."""
+    global confirmed_sign_text, ocr_debug_confirmed, sign_candidate_text, sign_candidate_count
+    if not text:
+        return
+    confirmed_sign_text = text
+    ocr_debug_confirmed = text
+    sign_candidate_text = text
+    sign_candidate_count = SIGN_CONFIRM_DETECTIONS
+    print(f"OCR CONFIRMED: {text}")
+    if speak_now and voice_enabled:
+        now = time.time()
+        if (
+            text != last_spoken_sign_text
+            or (now - last_sign_voice_time) >= OCR_VOICE_REPEAT_SECONDS
+        ):
+            speak_chosen_message(build_sign_speech(text), "sign", text, False)
 
 
 def matching_camera_object(
@@ -1148,7 +1182,9 @@ def process_voice_alerts() -> str:
     choice = choose_voice_message(dets, CAMERA_WIDTH)
     if choice is not None:
         spoken_text, category, track_key, interrupt = choice
-        speak_chosen_message(spoken_text, category, track_key, interrupt)
+        if speak_chosen_message(spoken_text, category, track_key, interrupt):
+            if category.startswith("lidar"):
+                print(f"Voice: {spoken_text}")
 
     return display_alert_summary()
 
@@ -1200,7 +1236,8 @@ def init_ocr_system() -> bool:
         f"OCR every {OCR_INTERVAL_SECONDS:.0f}s; "
         f"sign voice repeat every {OCR_VOICE_REPEAT_SECONDS:.0f}s; "
         f"stable reads {OCR_REQUIRE_STABLE_READS} in {OCR_STABLE_WINDOW_SECONDS:.0f}s; "
-        f"vocabulary={len(KNOWN_SIGN_WORDS)} words"
+        f"vocabulary correction={'ON' if OCR_VOCABULARY_CORRECTION else 'OFF'} "
+        f"(reads any sign up to {OCR_MAX_TEXT_LENGTH} chars)"
     )
     return True
 
@@ -1221,6 +1258,24 @@ def get_upper_ocr_box(frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
 
 def is_known_sign_word(text: str) -> bool:
     return text in KNOWN_SIGN_WORDS
+
+
+def is_valid_sign_text(text: str) -> bool:
+    """True if OCR text looks like readable sign text (any words, not just vocabulary)."""
+    if not text:
+        return False
+    t = text.strip().upper()
+    if len(t) < OCR_MIN_TEXT_LENGTH:
+        return False
+    compact = t.replace(" ", "")
+    if len(compact) > OCR_MAX_TEXT_LENGTH:
+        return False
+    alpha = sum(1 for c in compact if c.isalpha())
+    if alpha < max(2, int(len(compact) * 0.45)):
+        return False
+    if len(compact) >= 3 and len(set(compact)) == 1:
+        return False
+    return True
 
 
 def _fix_ocr_chars_in_word(word: str) -> str:
@@ -1277,7 +1332,7 @@ def clean_ocr_text(text: str) -> str:
     compact = t.replace(" ", "")
     if len(compact) < OCR_MIN_TEXT_LENGTH:
         return ""
-    if len(compact) > OCR_MAX_TEXT_LENGTH and not is_known_sign_word(t):
+    if len(compact) > OCR_MAX_TEXT_LENGTH:
         return ""
 
     if len(compact) >= 3 and len(set(compact)) == 1:
@@ -1286,21 +1341,22 @@ def clean_ocr_text(text: str) -> str:
         return ""
 
     digit_count = sum(1 for c in compact if c.isdigit())
-    if digit_count > 0 and digit_count / len(compact) > 0.35:
+    if digit_count > 0 and digit_count / len(compact) > 0.55:
         return ""
 
     if not any(c in "AEIOU" for c in compact):
-        if t not in VOWELLESS_OK and not any(t == w or t.startswith(w + " ") for w in VOWELLESS_OK):
+        if (
+            len(compact) > 6
+            and t not in VOWELLESS_OK
+            and not any(t == w or t.startswith(w + " ") for w in VOWELLESS_OK)
+        ):
             return ""
-
-    if OCR_USE_SIGN_VOCABULARY and len(t) > OCR_MAX_TEXT_LENGTH and not is_known_sign_word(t):
-        return ""
 
     return t
 
 
 def match_known_sign_text(text: str) -> str:
-    """Fuzzy-match OCR text to KNOWN_SIGN_WORDS. Returns best match or empty if rejected."""
+    """Fuzzy-match common signs when close; otherwise return any cleaned OCR text."""
     cleaned = clean_ocr_text(text)
     candidates: List[str] = []
     if cleaned:
@@ -1309,21 +1365,30 @@ def match_known_sign_text(text: str) -> str:
     rough = re.sub(r"\s+", " ", rough).strip()
     if rough and rough not in candidates:
         candidates.append(rough)
+
+    if not candidates:
+        return ""
+
     for cand in candidates:
         if is_known_sign_word(cand):
             return cand
-    best_word = ""
-    best_ratio = 0.0
-    for cand in candidates:
-        for known in KNOWN_SIGN_WORDS:
-            ratio = difflib.SequenceMatcher(None, cand, known).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_word = known
-    if best_ratio >= OCR_FUZZY_MATCH_THRESHOLD:
-        return best_word
-    if OCR_USE_SIGN_VOCABULARY:
-        return ""
+
+    if OCR_VOCABULARY_CORRECTION:
+        best_word = ""
+        best_ratio = 0.0
+        for cand in candidates:
+            for known in KNOWN_SIGN_WORDS:
+                ratio = difflib.SequenceMatcher(None, cand, known).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_word = known
+        if best_ratio >= OCR_FUZZY_MATCH_THRESHOLD:
+            return best_word
+        if best_ratio >= 0.48 and best_word:
+            short_len = min(len(c.replace(" ", "")) for c in candidates)
+            if short_len <= 12:
+                return best_word
+
     return cleaned or rough
 
 
@@ -1342,17 +1407,15 @@ def score_ocr_result(
     frame_area = max(1, fw * fh)
     area_ratio = box_area / frame_area
 
-    score = 0.35
+    score = 0.40
     if is_known_sign_word(text):
-        score += 0.45
-    elif OCR_USE_SIGN_VOCABULARY:
-        score -= 0.25
+        score += 0.25
 
     text_len = len(text.replace(" ", ""))
-    if 3 <= text_len <= 12:
+    if 3 <= text_len <= 24:
         score += 0.15
-    elif text_len > 16:
-        score -= 0.20
+    elif text_len > 32:
+        score -= 0.15
 
     digit_count = sum(1 for c in text if c.isdigit())
     if digit_count > 0:
@@ -1398,7 +1461,10 @@ def _bbox_overlap_ratio(
 
 def _ocr_tesseract_configs() -> List[str]:
     whitelist = " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return [f"--oem 3 --psm {psm}{whitelist}" for psm in (6, 7, 11, 13)]
+    configs = [f"--oem 3 --psm {psm}{whitelist}" for psm in (7, 8, 6, 11)]
+    # Also try without whitelist so custom / longer sign text is not blocked
+    configs.extend(f"--oem 3 --psm {psm}" for psm in (6, 7, 11))
+    return configs
 
 
 def _ocr_single_roi(
@@ -1440,12 +1506,15 @@ def _ocr_single_roi(
             cleaned = clean_ocr_text(raw_txt)
             matched = match_known_sign_text(raw_txt)
             final_text = matched or cleaned
-            if not final_text:
+            if not final_text or not is_valid_sign_text(final_text):
                 continue
             if final_text in seen:
                 continue
             seen.add(final_text)
             score = score_ocr_result(final_text, (x1, y1, x2, y2), frame_shape)
+            centre = get_centre_ocr_box(frame_shape[1], frame_shape[0])
+            if _bbox_overlap_ratio((x1, y1, x2, y2), centre) > 0.25:
+                score = min(1.0, score + 0.12)
             if score < OCR_MIN_CONFIDENCE_SCORE:
                 continue
             results.append(OCRResult(
@@ -1500,13 +1569,16 @@ def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List
     gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     rois: List[Tuple[int, int, int, int]] = []
 
+    # Centre box first — user aims sign here
+    centre = get_centre_ocr_box(w, h)
+    rois.append(centre)
+
     sign_like = ("sign", "stop", "exit", "text", "poster")
     for d in detections:
         if any(s in d.label.lower() for s in sign_like):
             rois.append(d.bbox)
 
     rois.extend(find_color_sign_rois(frame_bgr))
-    rois.append(get_centre_ocr_box(w, h))
     rois.append(get_upper_ocr_box(w, h))
 
     if OCR_WHOLE_FRAME_FALLBACK:
@@ -1514,12 +1586,21 @@ def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List
 
     results: List[OCRResult] = []
     seen_boxes: set = set()
-    for box in rois:
+    for box_idx, box in enumerate(rois):
         key = (box[0] // 20, box[1] // 20, box[2] // 20, box[3] // 20)
         if key in seen_boxes:
             continue
         seen_boxes.add(key)
+        before = len(results)
         _ocr_single_roi(gray_full, box, results, frame_shape)
+        if box_idx == 0 and len(results) > before:
+            best_centre = max(results[before:], key=lambda r: r.score)
+            if (
+                _bbox_overlap_ratio(best_centre.bbox, centre) > 0.25
+                and best_centre.score >= OCR_MANUAL_CONFIRM_SCORE
+                and is_valid_sign_text(best_centre.text)
+            ):
+                break
 
     results.sort(key=lambda r: (-r.score, -r.confidence))
     return results[:5]
@@ -1585,11 +1666,18 @@ def apply_ocr_scan_results(new_items: List[OCRResult], manual: bool = False) -> 
     last_ocr_text = vote_text
 
     if vote_count >= OCR_REQUIRE_STABLE_READS:
-        ocr_debug_confirmed = vote_text
-        confirmed_sign_text = vote_text
-        sign_candidate_text = vote_text
-        sign_candidate_count = SIGN_CONFIRM_DETECTIONS
-        print(f"OCR CONFIRMED: {vote_text}")
+        confirm_sign_text(vote_text, speak_now=True)
+    elif manual and vote_text and is_valid_sign_text(vote_text) and best.score >= OCR_MANUAL_CONFIRM_SCORE:
+        confirm_sign_text(vote_text, speak_now=True)
+        print(f"Manual OCR confirmed: {vote_text} (score={best.score:.2f})")
+    elif (
+        not manual
+        and vote_count >= 1
+        and is_valid_sign_text(vote_text)
+        and best.score >= OCR_AUTO_SINGLE_READ_SCORE
+    ):
+        confirm_sign_text(vote_text, speak_now=True)
+        print(f"High-confidence OCR confirmed: {vote_text} (score={best.score:.2f})")
     elif manual:
         print(f"OCR not confirmed yet — need {OCR_REQUIRE_STABLE_READS} reads in "
               f"{OCR_STABLE_WINDOW_SECONDS:.0f}s (have {vote_count})")
@@ -2208,7 +2296,7 @@ def draw_camera_overlays(frame_bgr: np.ndarray, dets: List[Detection], ocr_items
         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA,
     )
     cv2.putText(
-        out, "Hold sign inside yellow box for 5-10 seconds",
+        out, "Hold sign in yellow box — 2 scans (~6s) or press R",
         (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA,
     )
 
@@ -2818,6 +2906,7 @@ def draw_debug_panel(
         f"ocr_votes={ocr_vote_counts}",
         f"ocr_candidates={', '.join(ocr_last_candidates[:6]) or '-'}",
         f"OCR_USE_SIGN_VOCABULARY={OCR_USE_SIGN_VOCABULARY} "
+        f"OCR_VOCAB_CORRECT={OCR_VOCABULARY_CORRECTION} "
         f"stable={OCR_REQUIRE_STABLE_READS}/{OCR_STABLE_WINDOW_SECONDS:.0f}s",
         "--- Sign / OCR voice ---",
         f"sign_candidate={sign_candidate_text or '-'} ({sign_candidate_count}/{SIGN_CONFIRM_DETECTIONS})",
