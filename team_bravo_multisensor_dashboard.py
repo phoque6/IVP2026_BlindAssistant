@@ -111,6 +111,18 @@ POLAR_BIN_DEG = 1.0
 ZONE_MIN_POINTS = 3
 TRAJECTORY_MAX = 400
 
+# LiDAR voice filter — when testing at a desk, your body in front triggers LiDAR
+# (expected). This ignores very-close FRONT hits for voice only (panel still shows).
+SELF_FILTER_VOICE = True
+SELF_FILTER_FRONT_M = 0.50
+
+# Camera vision alerts (objects / signs within 1 m)
+CAMERA_ALERT_DISTANCE_M = 1.0
+CAMERA_VISION_INTERVAL = 3          # run heavy detection every N camera frames
+CAMERA_VOICE_MIN_DETECTIONS = 6
+REF_PERSON_AREA_1M = 14000          # tune bbox area at ~1 m for 320x240
+REF_SIGN_AREA_1M = 3200
+
 # ---------------------------------------------------------------------------
 # Blind navigation voice
 # ---------------------------------------------------------------------------
@@ -168,6 +180,7 @@ mapping_paused = False
 visual_mode = VIS_MODE_STANDARD
 show_debug = False
 fullscreen = False
+zones_fullscreen = False   # Z key: large zones overlay ON TOP of all 4 panels (panels stay visible)
 voice_enabled = ENABLE_VOICE_ALERTS
 
 points_xy = []
@@ -190,6 +203,16 @@ last_spoken_alert_state = ""
 clear_streak = 0
 zone_counts = {}
 last_voice_time = 0.0
+
+# Camera vision (separate from LiDAR — was NOT triggering voice before)
+camera_detections = []
+camera_raw_alert = "CLEAR"
+camera_candidate_alert = "CLEAR"
+camera_candidate_count = 0
+camera_confirmed_alert = "CLEAR"
+camera_banner_text = ""
+camera_frame_count = 0
+hog_detector = None
 
 current_voice_process = None
 tts_executable = None
@@ -224,6 +247,15 @@ latest_camera_frame = None
 prev_gray = None
 flow_points = None
 sim_flow_phase = 0.0
+
+
+def full_zones_content_rect():
+    """Full-screen obstacle zone area (between header and footer)."""
+    return pygame.Rect(
+        PANEL_GAP, HEADER_H + PANEL_GAP,
+        WIDTH - 2 * PANEL_GAP,
+        HEIGHT - HEADER_H - FOOTER_H - 2 * PANEL_GAP,
+    )
 
 
 # =============================================================================
@@ -709,10 +741,13 @@ def grab_camera_frame_bgr():
 
 
 def camera_reader_loop():
-    """Background thread: grab frames and compute sparse optical flow."""
-    global latest_camera_frame
+    """Background thread: grab frames, optical flow, and object/sign vision."""
+    global latest_camera_frame, camera_detections, camera_frame_count
     if not camera_available:
         return
+
+    init_hog_detector()
+    last_dets = []
 
     while running:
         frame = grab_camera_frame_bgr()
@@ -722,12 +757,21 @@ def camera_reader_loop():
 
         if CV2_AVAILABLE:
             frame = cv2.resize(frame, (CAMERA_WIDTH, CAMERA_HEIGHT))
+            camera_frame_count += 1
+            run_hog = (camera_frame_count % CAMERA_VISION_INTERVAL == 0)
+            dets = analyze_camera_frame(frame, run_hog=run_hog)
+            if dets or run_hog:
+                last_dets = dets
+                alert, banner = pick_camera_alert(dets)
+                update_camera_voice_state_machine(alert, banner)
+            frame = draw_vision_overlay(frame, last_dets)
             rgb = _apply_optical_flow_arrows(frame)
         else:
             rgb = frame
 
         with camera_lock:
             latest_camera_frame = rgb
+            camera_detections = list(last_dets)
         time.sleep(0.02)
 
 
@@ -758,6 +802,227 @@ def camera_status_label():
     if camera_source == "usb":
         return "USB"
     return "SIM"
+
+
+# =============================================================================
+# CAMERA VISION — OBJECTS & SIGNS (≤ 1 m)
+# =============================================================================
+
+def init_hog_detector():
+    global hog_detector
+    if not CV2_AVAILABLE or hog_detector is not None:
+        return hog_detector is not None
+    try:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        hog_detector = hog
+        print("Camera vision: HOG person detector ready.")
+        return True
+    except Exception as exc:
+        print(f"Camera vision HOG init failed: {exc}")
+        return False
+
+
+def estimate_distance_from_bbox(area_px, ref_area_at_1m):
+    """Monocular distance estimate from bounding-box size (prototype)."""
+    if area_px <= 0:
+        return 9.9
+    return max(0.15, math.sqrt(ref_area_at_1m / area_px))
+
+
+def _signs_from_color_mask(frame_bgr, lower, upper, color_name):
+    """Find coloured sign-like blobs in HSV range."""
+    if not CV2_AVAILABLE:
+        return []
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    found = []
+    h_img, w_img = frame_bgr.shape[:2]
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 350:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw < 18 or bh < 18:
+            continue
+        cx = x + bw // 2
+        # Signs ahead are usually in centre-lower field of view
+        if cx < w_img * 0.15 or cx > w_img * 0.85:
+            continue
+        dist_m = estimate_distance_from_bbox(bw * bh, REF_SIGN_AREA_1M)
+        if dist_m > CAMERA_ALERT_DISTANCE_M:
+            continue
+        aspect = bw / max(bh, 1)
+        if color_name == "red":
+            label = "STOP sign"
+        elif color_name == "yellow":
+            label = "Caution sign" if aspect < 1.6 else "Warning sign"
+        elif color_name == "blue":
+            label = "Information sign"
+        else:
+            label = "Sign"
+        found.append({
+            "label": label, "distance_m": dist_m,
+            "bbox": (x, y, bw, bh), "kind": "sign",
+        })
+    return found
+
+
+def detect_signs_in_frame(frame_bgr):
+    """Colour-based sign detection (prototype — not OCR)."""
+    if not CV2_AVAILABLE or np is None:
+        return []
+    detections = []
+    # Red (two HSV wraps)
+    detections.extend(_signs_from_color_mask(frame_bgr, (0, 90, 70), (10, 255, 255), "red"))
+    detections.extend(_signs_from_color_mask(frame_bgr, (160, 90, 70), (179, 255, 255), "red"))
+    detections.extend(_signs_from_color_mask(frame_bgr, (18, 90, 90), (38, 255, 255), "yellow"))
+    detections.extend(_signs_from_color_mask(frame_bgr, (95, 80, 60), (125, 255, 255), "blue"))
+    return detections
+
+
+def detect_people_in_frame(frame_bgr):
+    """HOG person detector — only report if estimated ≤ 1 m."""
+    if hog_detector is None or not CV2_AVAILABLE:
+        return []
+    found = []
+    try:
+        boxes, weights = hog_detector.detectMultiScale(
+            frame_bgr, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        for (x, y, bw, bh), w in zip(boxes, weights):
+            if w < 0.4:
+                continue
+            dist_m = estimate_distance_from_bbox(bw * bh, REF_PERSON_AREA_1M)
+            if dist_m > CAMERA_ALERT_DISTANCE_M:
+                continue
+            found.append({
+                "label": "Person", "distance_m": dist_m,
+                "bbox": (int(x), int(y), int(bw), int(bh)), "kind": "person",
+            })
+    except Exception:
+        pass
+    return found
+
+
+def detect_objects_in_frame(frame_bgr):
+    """Large foreground objects in centre view (simple contour heuristic)."""
+    if not CV2_AVAILABLE:
+        return []
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blur, 40, 120)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h_img, w_img = frame_bgr.shape[:2]
+    found = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 2500:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        cx = x + bw // 2
+        if cx < w_img * 0.25 or cx > w_img * 0.75 or y < h_img * 0.15:
+            continue
+        dist_m = estimate_distance_from_bbox(bw * bh, REF_SIGN_AREA_1M * 2.5)
+        if dist_m > CAMERA_ALERT_DISTANCE_M:
+            continue
+        found.append({
+            "label": "Object", "distance_m": dist_m,
+            "bbox": (x, y, bw, bh), "kind": "object",
+        })
+        if len(found) >= 2:
+            break
+    return found
+
+
+def analyze_camera_frame(frame_bgr, run_hog=True):
+    """
+    Detect people, signs, and objects within CAMERA_ALERT_DISTANCE_M.
+    Returns list of detection dicts with label, distance_m, bbox, kind.
+    """
+    if not CV2_AVAILABLE:
+        return []
+    if run_hog:
+        init_hog_detector()
+    detections = []
+    detections.extend(detect_signs_in_frame(frame_bgr))
+    if run_hog:
+        detections.extend(detect_people_in_frame(frame_bgr))
+    if not detections and run_hog:
+        detections.extend(detect_objects_in_frame(frame_bgr))
+    detections.sort(key=lambda d: d["distance_m"])
+    return detections[:5]
+
+
+def pick_camera_alert(detections):
+    """Choose highest-priority camera alert from detections ≤ 1 m."""
+    if not detections:
+        return "CLEAR", ""
+    best = detections[0]
+    label = best["label"]
+    if "STOP" in label:
+        return "CAMERA_STOP_SIGN", f"STOP SIGN {best['distance_m']:.1f}m"
+    if "Caution" in label or "Warning" in label:
+        return "CAMERA_CAUTION_SIGN", f"CAUTION SIGN {best['distance_m']:.1f}m"
+    if best["kind"] == "person":
+        return "CAMERA_PERSON", f"PERSON {best['distance_m']:.1f}m"
+    if best["kind"] == "sign":
+        return "CAMERA_SIGN", f"SIGN {best['distance_m']:.1f}m"
+    return "CAMERA_OBJECT", f"OBJECT {best['distance_m']:.1f}m"
+
+
+def draw_vision_overlay(frame_bgr, detections):
+    """Draw bounding boxes on camera frame."""
+    out = frame_bgr.copy()
+    for det in detections:
+        x, y, bw, bh = det["bbox"]
+        col = (0, 255, 255)
+        if det["kind"] == "person":
+            col = (0, 200, 255)
+        elif det["kind"] == "sign":
+            col = (0, 80, 255)
+        cv2.rectangle(out, (x, y), (x + bw, y + bh), col, 2)
+        txt = f"{det['label']} {det['distance_m']:.1f}m"
+        cv2.putText(out, txt, (x, max(12, y - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
+    return out
+
+
+def update_camera_voice_state_machine(raw_alert, banner):
+    global camera_raw_alert, camera_candidate_alert, camera_candidate_count
+    global camera_confirmed_alert, camera_banner_text
+    camera_raw_alert = raw_alert
+    camera_banner_text = banner
+    if raw_alert == camera_candidate_alert:
+        camera_candidate_count += 1
+    else:
+        camera_candidate_alert = raw_alert
+        camera_candidate_count = 1
+    if camera_candidate_count >= CAMERA_VOICE_MIN_DETECTIONS:
+        camera_confirmed_alert = camera_candidate_alert
+    elif raw_alert == "CLEAR":
+        camera_confirmed_alert = "CLEAR"
+
+
+def camera_warning_to_speech(alert_state):
+    mapping = {
+        "CAMERA_PERSON": "Person close ahead",
+        "CAMERA_STOP_SIGN": "Stop sign ahead",
+        "CAMERA_CAUTION_SIGN": "Caution sign ahead",
+        "CAMERA_SIGN": "Sign ahead",
+        "CAMERA_OBJECT": "Object close ahead",
+    }
+    return mapping.get(alert_state, "")
+
+
+def lidar_suppressed_by_camera(lidar_alert, camera_alert):
+    """Avoid duplicate generic LiDAR front alert when camera has semantic detection."""
+    if camera_alert == "CLEAR":
+        return False
+    if lidar_alert in ("NORMAL_FRONT", "STRONG_FRONT") and camera_alert.startswith("CAMERA_"):
+        return True
+    return False
 
 
 def distance_to_color(distance_m):
@@ -805,12 +1070,27 @@ def _zone_count(points, pred):
     return sum(1 for x_m, y_m, d, _a in points if pred(x_m, y_m, d))
 
 
-def detect_obstacles_for_blind_user(latest_points):
+def _lidar_point_counts_for_voice(x_m, y_m, distance_m):
+    """Skip very-close front hits when desk self-filter is on (voice only)."""
+    if (SELF_FILTER_VOICE and x_m > 0 and abs(y_m) <= 0.45
+            and distance_m < SELF_FILTER_FRONT_M):
+        return False
+    return True
+
+
+def detect_obstacles_for_blind_user(latest_points, for_voice=False):
+    """
+    Cluster-based zone detection.
+    for_voice=True applies desk self-filter so leaning over the sensor does not spam alerts.
+    """
     zc = {
         "front": 0, "back": 0, "left": 0, "right": 0,
         "vc_front": 0, "vc_back": 0, "vc_left": 0, "vc_right": 0,
     }
+
     for x_m, y_m, distance_m, _a in latest_points:
+        if for_voice and not _lidar_point_counts_for_voice(x_m, y_m, distance_m):
+            continue
         if x_m > 0 and abs(y_m) <= 0.45 and distance_m <= ALERT_DISTANCE_M:
             zc["front"] += 1
         if x_m < 0 and abs(y_m) <= 0.45 and distance_m <= 0.75:
@@ -895,7 +1175,7 @@ def is_very_close_alert(alert_state):
 
 def update_voice_state_machine(raw_alert):
     global raw_alert_state, candidate_alert_state, candidate_count
-    global confirmed_alert_state, clear_streak, display_banner_text, zone_counts
+    global confirmed_alert_state, clear_streak
 
     raw_alert_state = raw_alert
     if raw_alert == candidate_alert_state:
@@ -909,7 +1189,6 @@ def update_voice_state_machine(raw_alert):
     elif raw_alert == "CLEAR":
         confirmed_alert_state = "CLEAR"
 
-    display_banner_text = alert_to_banner(raw_alert)
     if raw_alert == "CLEAR":
         clear_streak += 1
     else:
@@ -1007,7 +1286,9 @@ def speak_voice_alert(alert_state, force=False):
         return False
     if force:
         stop_current_voice()
-    text = warning_to_speech(alert_state)
+    text = camera_warning_to_speech(alert_state) or warning_to_speech(alert_state)
+    if not text:
+        return False
     print(f">>> VOICE: {text}")
     if not run_tts(text):
         print("\a", end="", flush=True)
@@ -1017,32 +1298,50 @@ def speak_voice_alert(alert_state, force=False):
     return True
 
 
+def effective_lidar_alert():
+    """Suppress generic LiDAR front alert when camera has a semantic detection."""
+    if lidar_suppressed_by_camera(confirmed_alert_state, camera_confirmed_alert):
+        return "CLEAR"
+    return confirmed_alert_state
+
+
 def process_voice_alerts():
     global last_spoken_alert_state, last_voice_time
     if not voice_enabled:
         return
     now = time.time()
-    alert = confirmed_alert_state
+    lidar = effective_lidar_alert()
+    camera = camera_confirmed_alert
     elapsed = now - last_voice_time
 
-    if is_very_close_alert(alert):
-        if alert != last_spoken_alert_state or elapsed >= VOICE_REPEAT_SECONDS:
-            speak_voice_alert(alert, force=True)
+    # LiDAR emergency STOP always highest priority
+    if is_very_close_alert(lidar):
+        if lidar != last_spoken_alert_state or elapsed >= VOICE_REPEAT_SECONDS:
+            speak_voice_alert(lidar, force=True)
         return
 
-    if alert == "CLEAR":
+    # Camera semantic alert (person / sign / object within 1 m)
+    if camera != "CLEAR":
+        if camera != last_spoken_alert_state:
+            if elapsed >= VOICE_COOLDOWN_SECONDS:
+                speak_voice_alert(camera, force=False)
+        elif elapsed >= VOICE_REPEAT_SECONDS:
+            speak_voice_alert(camera, force=False)
+        return
+
+    if lidar == "CLEAR":
         if last_spoken_alert_state and last_spoken_alert_state != "CLEAR":
             if clear_streak >= ZONE_CLEAR_SCANS and elapsed >= CLEAR_VOICE_MIN_GAP:
                 speak_voice_alert("CLEAR", force=False)
         return
 
-    if alert == last_spoken_alert_state:
+    if lidar == last_spoken_alert_state:
         if elapsed >= VOICE_REPEAT_SECONDS:
-            speak_voice_alert(alert, force=False)
+            speak_voice_alert(lidar, force=False)
         return
 
     if elapsed >= VOICE_COOLDOWN_SECONDS:
-        speak_voice_alert(alert, force=False)
+        speak_voice_alert(lidar, force=False)
 
 
 def test_voice():
@@ -1056,11 +1355,20 @@ def update_alerts():
     global nearest_left_m, nearest_front_m, nearest_right_m, nearest_back_m, zone_counts
     with data_lock:
         latest = list(latest_scan_points)
-    alert, _nearest, zc = detect_obstacles_for_blind_user(latest)
+    # Display uses all LiDAR points; voice uses self-filter for desk testing
+    alert_display, _nearest, zc = detect_obstacles_for_blind_user(latest, for_voice=False)
+    alert_voice, _, _ = detect_obstacles_for_blind_user(latest, for_voice=True)
     zone_counts = zc
     back_d, left_d, front_d, right_d = compute_direction_distances(latest)
     nearest_back_m, nearest_left_m, nearest_front_m, nearest_right_m = back_d, left_d, front_d, right_d
-    update_voice_state_machine(alert)
+    update_voice_state_machine(alert_voice)
+    # Banner shows LiDAR + camera info
+    if camera_banner_text and camera_raw_alert != "CLEAR":
+        display_banner_text_local = f"{alert_to_banner(alert_display)} | {camera_banner_text}"
+    else:
+        display_banner_text_local = alert_to_banner(alert_display)
+    global display_banner_text
+    display_banner_text = display_banner_text_local
     process_voice_alerts()
 
 
@@ -1109,49 +1417,108 @@ def draw_optical_flow_panel(screen, rect):
     draw_simulated_optical_flow(screen, rect)
 
 
+def obstacle_zone_rects(rect):
+    """Cross layout: FRONT/BACK/LEFT/RIGHT fill the entire panel."""
+    pad = 4
+    gutter = 10
+    r = rect.inflate(-pad * 2, -pad * 2)
+    w, h = r.width, r.height
+    cx = r.centerx
+    top_h = int(h * 0.38)
+    bot_h = int(h * 0.38)
+    mid_h = h - top_h - bot_h - gutter
+    arm_w = (w - gutter) // 2
+
+    front = pygame.Rect(r.x, r.y, w, top_h)
+    back = pygame.Rect(r.x, r.bottom - bot_h, w, bot_h)
+    mid_y = r.y + top_h + gutter // 2
+    left = pygame.Rect(r.x, mid_y, arm_w, mid_h)
+    right = pygame.Rect(r.right - arm_w, mid_y, arm_w, mid_h)
+    center = pygame.Rect(cx - 78, mid_y, 156, mid_h)
+    return front, back, left, right, center
+
+
+def draw_zone_block(screen, block, label, dist, font, font_sm):
+    """Draw one directional zone block filling its rectangle."""
+    _level, col = zone_level(dist)
+    fill = pygame.Surface((block.width, block.height), pygame.SRCALPHA)
+    fill.fill((*col, 100))
+    screen.blit(fill, block.topleft)
+    pygame.draw.rect(screen, col, block, 3)
+
+    title = font.render(label, True, COLOR_TITLE)
+    screen.blit(title, title.get_rect(center=(block.centerx, block.centery - 14)))
+    dist_str = "CLEAR" if dist is None else f"{dist:.2f} m"
+    dist_surf = font_sm.render(dist_str, True, COLOR_HUD)
+    screen.blit(dist_surf, dist_surf.get_rect(center=(block.centerx, block.centery + 12)))
+
+
 def draw_obstacle_zones_panel(screen, rect):
-    """Semantic-style zone blocks: FRONT / LEFT / RIGHT / BACK."""
-    font = pygame.font.SysFont("monospace", 13, bold=True)
-    font_sm = pygame.font.SysFont("monospace", 11)
-    inner = rect.inflate(-8, -8)
-    cx, cy = inner.centerx, inner.centery
-    bw, bh = inner.width // 2 - 12, inner.height // 2 - 12
+    """Full cross-layout obstacle zones — FRONT / LEFT / RIGHT / BACK fill the area."""
+    scale = 1.6 if rect.height > 400 else 1.0
+    font = pygame.font.SysFont("monospace", int(16 * scale), bold=True)
+    font_sm = pygame.font.SysFont("monospace", int(13 * scale))
+    font_banner = pygame.font.SysFont("monospace", int(14 * scale), bold=True)
 
-    zones = [
-        ("FRONT", nearest_front_m, cx, inner.y + 8, bw, bh),
-        ("BACK", nearest_back_m, cx, inner.bottom - bh - 8, bw, bh),
-        ("LEFT", nearest_left_m, inner.x + 8, cy, bw, bh),
-        ("RIGHT", nearest_right_m, inner.right - bw - 8, cy, bw, bh),
-    ]
+    front, back, left, right, center = obstacle_zone_rects(rect)
+    draw_zone_block(screen, front, "FRONT", nearest_front_m, font, font_sm)
+    draw_zone_block(screen, back, "BACK", nearest_back_m, font, font_sm)
+    draw_zone_block(screen, left, "LEFT", nearest_left_m, font, font_sm)
+    draw_zone_block(screen, right, "RIGHT", nearest_right_m, font, font_sm)
 
-    for label, dist, zx, zy, zw, zh in zones:
-        _level, col = zone_level(dist)
-        block = pygame.Rect(zx - zw // 2, zy - bh // 2, zw, bh)
-        fill = pygame.Surface((zw, bh), pygame.SRCALPHA)
-        fill.fill((*col, 90))
-        screen.blit(fill, block.topleft)
-        pygame.draw.rect(screen, col, block, 2)
-        txt = font.render(label, True, COLOR_TITLE)
-        screen.blit(txt, txt.get_rect(center=block.center))
-        dist_txt = font_sm.render("clear" if dist is None else f"{dist:.2f} m", True, COLOR_HUD)
-        screen.blit(dist_txt, dist_txt.get_rect(midtop=(block.centerx, block.bottom + 2)))
-
-    # Centre status
     banner_col = COLOR_GREEN
     if "STOP" in display_banner_text:
         banner_col = COLOR_RED
     elif "CAREFUL" in display_banner_text:
         banner_col = COLOR_ORANGE
-    elif "OBSTACLE" in display_banner_text:
+    elif "OBSTACLE" in display_banner_text or "SIGN" in display_banner_text or "PERSON" in display_banner_text:
         banner_col = COLOR_YELLOW
 
-    centre = pygame.Rect(cx - 90, cy - 28, 180, 56)
-    centre_fill = pygame.Surface((180, 56), pygame.SRCALPHA)
-    centre_fill.fill((0, 0, 0, 200))
-    screen.blit(centre_fill, centre.topleft)
-    pygame.draw.rect(screen, banner_col, centre, 2)
-    banner = font.render(display_banner_text[:22], True, banner_col)
-    screen.blit(banner, banner.get_rect(center=centre.center))
+    centre_fill = pygame.Surface((center.width, center.height), pygame.SRCALPHA)
+    centre_fill.fill((0, 0, 0, 220))
+    screen.blit(centre_fill, center.topleft)
+    pygame.draw.rect(screen, banner_col, center, 2)
+
+    banner_lines = display_banner_text.split(" | ")
+    y = center.y + 8
+    for line in banner_lines[:2]:
+        banner = font_banner.render(line[:28], True, banner_col)
+        screen.blit(banner, banner.get_rect(centerx=center.centerx, y=y))
+        y += banner.get_height() + 2
+
+    if camera_banner_text and camera_raw_alert != "CLEAR":
+        cam_txt = font_sm.render(camera_banner_text[:24], True, COLOR_CYAN)
+        screen.blit(cam_txt, cam_txt.get_rect(centerx=center.centerx, y=center.bottom - 18))
+
+    hint = font_sm.render("LiDAR zones + camera ≤1m", True, (100, 130, 160))
+    screen.blit(hint, hint.get_rect(midbottom=(rect.centerx, rect.bottom - 2)))
+
+
+def draw_zones_overlay(screen):
+    """
+    Large obstacle-zone overlay (Z key).
+    Drawn on top of all 4 panels — LiDAR map, metric distance, and optical flow stay visible behind.
+    Press Z again to close.
+    """
+    overlay_h = HEIGHT - HEADER_H - FOOTER_H
+    backdrop = pygame.Surface((WIDTH, overlay_h), pygame.SRCALPHA)
+    backdrop.fill((0, 0, 0, 140))
+    screen.blit(backdrop, (0, HEADER_H))
+
+    rect = full_zones_content_rect()
+    pygame.draw.rect(screen, COLOR_PANEL, rect)
+    pygame.draw.rect(screen, COLOR_PANEL_BORDER, rect, 3)
+
+    font_title = pygame.font.SysFont("monospace", 16, bold=True)
+    font_hint = pygame.font.SysFont("monospace", 11)
+    title = font_title.render("OBSTACLE ZONES — EXPANDED (Z to close)", True, COLOR_TITLE)
+    screen.blit(title, (rect.x + 12, rect.y + 6))
+    hint = font_hint.render(
+        "Map, LiDAR heatmap & camera panels remain visible behind this overlay", True, (120, 160, 200))
+    screen.blit(hint, (rect.x + 12, rect.y + 26))
+
+    inner = pygame.Rect(rect.x + 8, rect.y + 42, rect.width - 16, rect.height - 50)
+    draw_obstacle_zones_panel(screen, inner)
 
 
 def draw_metric_distance_panel(screen, rect, latest):
@@ -1274,14 +1641,16 @@ def draw_header(screen, font):
     title = font.render("Team Bravo Multi-Sensor Perception Dashboard", True, COLOR_TITLE)
     screen.blit(title, (12, 10))
     status = (f"LiDAR:{'SIM' if SIMULATED_MODE else 'LIVE'}  "
-              f"Cam:{camera_status_label()}  Voice:{'ON' if voice_enabled else 'OFF'}")
+              f"Cam:{camera_status_label()}  Voice:{'ON' if voice_enabled else 'OFF'}  "
+              f"Filter:{'ON' if SELF_FILTER_VOICE else 'OFF'}")
     screen.blit(pygame.font.SysFont("monospace", 12).render(status, True, COLOR_HUD),
                 (WIDTH - 380, 14))
 
 
 def draw_footer(screen, font, fps):
     pygame.draw.rect(screen, COLOR_HEADER, (0, HEIGHT - FOOTER_H, WIDTH, FOOTER_H))
-    controls = "Q=Quit  C=Clear  S=Save  V=Voice  T=Test  M=Mode  F=Full  Space=Pause  +/-=Zoom  D=Debug"
+    controls = ("Q=Quit  C=Clear  S=Save  V=Voice  T=Test  Z=Zones  B=Filter  "
+                "M=Mode  F=Full  Space=Pause  +/-=Zoom  D=Debug")
     screen.blit(font.render(controls, True, (110, 130, 155)), (8, HEIGHT - FOOTER_H + 6))
     screen.blit(font.render(f"FPS:{fps:.0f}  Pkts:{packet_count}  Zoom:{PIXELS_PER_METER}", True, COLOR_HUD),
                 (WIDTH - 220, HEIGHT - FOOTER_H + 6))
@@ -1295,6 +1664,8 @@ def draw_debug_overlay(screen, font):
         f"confirmed:{confirmed_alert_state}  spoken:{last_spoken_alert_state or '-'}",
         f"zones F/L/R/B: {zone_counts.get('front',0)}/{zone_counts.get('left',0)}/"
         f"{zone_counts.get('right',0)}/{zone_counts.get('back',0)}",
+        f"camera: {camera_raw_alert} ({camera_candidate_count}/{CAMERA_VOICE_MIN_DETECTIONS})  "
+        f"self-filter:{'ON' if SELF_FILTER_VOICE else 'OFF'}",
     ]
     y = HEADER_H + 4
     for line in lines:
@@ -1365,6 +1736,7 @@ def save_dashboard(screen):
 def main():
     global running, ser, mapping_paused, voice_enabled, fullscreen
     global show_debug, visual_mode, PIXELS_PER_METER, camera_cap, camera_available
+    global zones_fullscreen, SELF_FILTER_VOICE
 
     print("=" * 72)
     print("Team Bravo Multi-Sensor Perception Dashboard")
@@ -1430,6 +1802,14 @@ def main():
                         print(f"Visual mode: {names[visual_mode]}")
                     elif event.key == pygame.K_d:
                         show_debug = not show_debug
+                    elif event.key == pygame.K_z:
+                        zones_fullscreen = not zones_fullscreen
+                        print(f"Zones overlay {'ON' if zones_fullscreen else 'OFF'} "
+                              "(all 4 panels still drawn underneath)")
+                    elif event.key == pygame.K_b:
+                        SELF_FILTER_VOICE = not SELF_FILTER_VOICE
+                        print(f"LiDAR desk self-filter {'ON' if SELF_FILTER_VOICE else 'OFF'} "
+                              f"(ignores front voice alerts < {SELF_FILTER_FRONT_M} m)")
                     elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                         PIXELS_PER_METER = min(PIXELS_PER_METER_MAX, PIXELS_PER_METER + 10)
                     elif event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE, pygame.K_KP_MINUS):
@@ -1446,6 +1826,7 @@ def main():
             screen.fill(COLOR_BG)
             draw_header(screen, font_header)
 
+            # Always draw all 4 panels (optical flow, zones, metric distance, local map)
             for title, col, row in PANEL_TITLES:
                 prect = panel_content_rect(col, row)
                 inner = draw_panel_frame(screen, prect, title)
@@ -1457,6 +1838,10 @@ def main():
                     draw_metric_distance_panel(screen, inner, latest)
                 elif title == "Local Map":
                     draw_local_map_panel(screen, inner, free_snap, occ_snap, latest, trail)
+
+            # Z = expanded zones overlay on top (does not hide map / LiDAR panels)
+            if zones_fullscreen:
+                draw_zones_overlay(screen)
 
             draw_footer(screen, font_footer, clock.get_fps())
             draw_debug_overlay(screen, font_debug)
