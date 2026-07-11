@@ -1,0 +1,80 @@
+Created and enhanced:
+
+IVP2026_BlindAssistant/team_bravo_aihat_camera_lidar_vision_assistant.py
+
+What it does
+4-panel dashboard (1280×720)
+Panel	Role
+Top left
+AI Camera Detection + Sign Reading (live feed, boxes, OCR text, AI FPS)
+Top right
+Obstacle Zones (LiDAR front/left/right/back)
+Bottom left
+LiDAR Distance View (heatmap-style scan)
+Bottom right
+Local Room Map (free space, walls, connected components)
+All four panels are always drawn — the camera window is never hidden.
+
+AI HAT layer (maximise Pi AI accelerator)
+Detection priority:
+
+AI HAT (init_ai_hat, load_ai_model, run_ai_hat_inference, parse_ai_hat_results)
+OpenCV DNN (models/yolov8n.onnx)
+HOG person detector
+Contour heuristic
+Simulated detections
+Hailo SDK hooks are clearly marked — the program does not crash if the runtime or model is missing; it falls back and shows AI HAT: FALLBACK in the header.
+
+OCR (sign reading)
+pytesseract with safe import
+Reads sign regions every 5 frames
+Voice: "Sign says Stop", "Sign says Exit", etc.
+OCR repeat gap: 15 seconds
+LiDAR + fusion
+D6 AA55 parsing, zones, local map
+fuse_camera_lidar_alerts() — LiDAR emergency STOP overrides everything
+Fused examples: "Careful. Person ahead", "Chair ahead", "Sign says Stop"
+Install (on Pi)
+sudo apt update
+sudo apt install python3-serial python3-pygame python3-opencv python3-numpy espeak-ng
+sudo apt install python3-picamera2
+sudo apt install tesseract-ocr python3-pytesseract
+Place models in models/:
+
+yolov8n.hef (AI HAT)
+coco_labels.txt
+yolov8n.onnx (optional DNN fallback)
+Run
+python3 team_bravo_aihat_camera_lidar_vision_assistant.py
+For classroom demo without hardware, set SIMULATED_MODE = True.
+
+Key controls
+Key	Action
+Q / Esc
+Quit
+V
+Toggle voice
+T
+Test voice
+O
+Toggle OCR
+I
+Toggle AI overlay boxes
+L
+Toggle LiDAR
+Z
+Zones overlay (panels stay visible behind)
+D
+Debug panel (AI HAT status, FPS, alerts)
+S
+Save PNG + CSV files
+AI HAT wiring (when you have the SDK)
+Edit the marked sections in:
+
+init_ai_hat()
+load_ai_model()
+run_ai_hat_inference()
+parse_ai_hat_results()
+Until those are filled in, OpenCV/HOG/simulation handles camera inference automatically.
+
+If you want, I can add a short models/README.md with Pi AI Kit setup steps and expected file paths.
