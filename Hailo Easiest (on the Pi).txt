@@ -1,0 +1,17 @@
+Easiest (on the Pi)
+Use the official Raspberry Pi Hailo examples — they download the right models for you:
+
+git clone https://github.com/hailo-ai/hailo-rpi5-examples.git
+cd hailo-rpi5-examples
+./download_resources.sh
+Models land in a resources/ folder (often names like yolov8s_h8l.hef for the Hailo-8L AI Kit / HAT).
+
+Then copy into your project:
+
+mkdir -p models
+cp resources/yolov8n*.hef models/yolov8n.hef
+# or if you only have yolov8s_h8l.hef:
+cp resources/yolov8s_h8l.hef models/yolov8n.hef
+Or change the path in the script:
+
+AI_MODEL_PATH = "models/yolov8s_h8l.hef"
