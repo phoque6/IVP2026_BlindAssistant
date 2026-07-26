@@ -125,9 +125,9 @@ AI_PROCESS_HEIGHT = 312
 DNN_EVERY_N_FRAMES = 8
 
 # Time-based camera processing (decoupled from capture rate)
-OCR_INTERVAL_SECONDS = 2.0
+OCR_INTERVAL_SECONDS = 2.5
 OCR_VOICE_REPEAT_SECONDS = 5.0
-OCR_PERSIST_SECONDS = 8.0
+OCR_PERSIST_SECONDS = 10.0
 OCR_FRAME_SCALE = 2.5
 AI_DETECTION_INTERVAL_SECONDS = 0.5
 CAMERA_SLEEP_SECONDS = 0.001
@@ -138,18 +138,18 @@ OCR_WHOLE_FRAME_FALLBACK = False
 # Vocabulary corrects common signs (EX1T->EXIT) but does NOT block unknown text
 OCR_USE_SIGN_VOCABULARY = False
 OCR_VOCABULARY_CORRECTION = True
-OCR_MIN_CONFIDENCE_SCORE = 0.40
-OCR_REQUIRE_STABLE_READS = 2
-OCR_MANUAL_CONFIRM_SCORE = 0.45
-OCR_AUTO_SINGLE_READ_SCORE = 0.68
+OCR_MIN_CONFIDENCE_SCORE = 0.28
+OCR_REQUIRE_STABLE_READS = 1
+OCR_MANUAL_CONFIRM_SCORE = 0.30
+OCR_AUTO_SINGLE_READ_SCORE = 0.50
 OCR_STABLE_WINDOW_SECONDS = 12.0
-OCR_FUZZY_MATCH_THRESHOLD = 0.82
-OCR_VOCAB_MAX_WORDS = 2
-OCR_VOCAB_MAX_CHARS = 14
-# Faster OCR: centre box first; only expand if centre finds nothing
-OCR_CENTRE_FIRST_ONLY = True
-OCR_MAX_EXTRA_ROIS = 2
-OCR_EARLY_EXIT_SCORE = 0.62
+OCR_FUZZY_MATCH_THRESHOLD = 0.70
+OCR_VOCAB_MAX_WORDS = 3
+OCR_VOCAB_MAX_CHARS = 18
+# Centre first, but always fall back to extra ROIs if centre is weak
+OCR_CENTRE_FIRST_ONLY = False
+OCR_MAX_EXTRA_ROIS = 4
+OCR_EARLY_EXIT_SCORE = 0.70
 
 KNOWN_SIGN_WORDS = [
     "EXIT",
@@ -178,8 +178,8 @@ ALERT_DISTANCE_M = 1.0
 STRONG_WARNING_DISTANCE_M = 0.75
 VERY_CLOSE_DISTANCE_M = 0.40
 
-# Sign / OCR voice — require 2 stable reads before speaking
-SIGN_CONFIRM_DETECTIONS = 2
+# Sign / OCR voice — speak after 1 stable read for classroom reliability
+SIGN_CONFIRM_DETECTIONS = 1
 SIGN_REPEAT_SECONDS = 5.0
 
 # Camera object voice
@@ -1259,21 +1259,54 @@ def init_ocr_system() -> bool:
 
 
 def get_centre_ocr_box(frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
-    """Tighter centre sign-reading region — fill this with the sign for best OCR."""
-    x1 = int(frame_w * 0.18)
-    y1 = int(frame_h * 0.22)
-    x2 = int(frame_w * 0.82)
-    y2 = int(frame_h * 0.72)
+    """Centre sign-reading region — hold the sign inside this yellow box."""
+    x1 = int(frame_w * 0.10)
+    y1 = int(frame_h * 0.15)
+    x2 = int(frame_w * 0.90)
+    y2 = int(frame_h * 0.80)
     return x1, y1, x2, y2
 
 
 def get_upper_ocr_box(frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
     """Upper sign band — signs are often mounted high."""
-    return 0, 0, frame_w, max(60, int(frame_h * 0.5))
+    return 0, 0, frame_w, max(60, int(frame_h * 0.55))
 
 
 def is_known_sign_word(text: str) -> bool:
     return text in KNOWN_SIGN_WORDS
+
+
+def extract_known_sign_from_text(text: str) -> str:
+    """Find a known sign word inside noisy OCR (e.g. 'THE EXIT AHEAD' -> EXIT)."""
+    if not text:
+        return ""
+    t = re.sub(r"[^A-Z0-9 ]+", " ", text.upper())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return ""
+    if is_known_sign_word(t):
+        return t
+    # Prefer longer known phrases first
+    for known in sorted(KNOWN_SIGN_WORDS, key=len, reverse=True):
+        if known in t:
+            return known
+    # Per-word fuzzy match
+    for word in t.split():
+        fixed = _fix_ocr_chars_in_word(word)
+        if is_known_sign_word(fixed):
+            return fixed
+        best_word = ""
+        best_ratio = 0.0
+        for known in KNOWN_SIGN_WORDS:
+            if " " in known:
+                continue
+            ratio = difflib.SequenceMatcher(None, fixed, known).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_word = known
+        if best_ratio >= OCR_FUZZY_MATCH_THRESHOLD and _fuzzy_length_ok(fixed, best_word):
+            return best_word
+    return ""
 
 
 def is_valid_sign_text(text: str) -> bool:
@@ -1416,7 +1449,11 @@ def clean_ocr_text(text: str) -> str:
 
 
 def match_known_sign_text(text: str) -> str:
-    """Fuzzy-match short sign phrases only; return cleaned text for longer OCR."""
+    """Fuzzy-match short sign phrases; also pull known signs out of longer OCR noise."""
+    extracted = extract_known_sign_from_text(text)
+    if extracted:
+        return extracted
+
     cleaned = clean_ocr_text(text)
     candidates: List[str] = []
     if cleaned:
@@ -1528,37 +1565,44 @@ def _bbox_overlap_ratio(
     return inter / a_area
 
 
-def _ocr_tesseract_configs(fast: bool = True) -> List[str]:
-    """Fewer configs = much faster on Pi. Whitelist helps short signs."""
+def _ocr_tesseract_configs(fast: bool = False) -> List[str]:
+    """Sign-friendly Tesseract configs."""
     whitelist = " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     if fast:
-        # Single-line + block modes only (best speed/accuracy tradeoff for signs)
         return [
             f"--oem 3 --psm 7{whitelist}",
+            f"--oem 3 --psm 8{whitelist}",
             f"--oem 3 --psm 6{whitelist}",
             "--oem 3 --psm 6",
         ]
-    whitelist_cfgs = [f"--oem 3 --psm {psm}{whitelist}" for psm in (7, 8, 6, 11)]
-    open_cfgs = [f"--oem 3 --psm {psm}" for psm in (6, 7, 11)]
-    return whitelist_cfgs + open_cfgs
+    return [
+        f"--oem 3 --psm 7{whitelist}",
+        f"--oem 3 --psm 8{whitelist}",
+        f"--oem 3 --psm 6{whitelist}",
+        f"--oem 3 --psm 11{whitelist}",
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 7",
+    ]
 
 
 def _prepare_ocr_variants(gray_roi: np.ndarray) -> List[np.ndarray]:
-    """CLAHE + Otsu / inverted — fewer variants for speed, better contrast for accuracy."""
+    """Multiple contrast variants so light/dark signs both work."""
     if cv2 is None:
         return [gray_roi]
     roi = gray_roi
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         roi = clahe.apply(roi)
     except Exception:
         pass
-    roi = cv2.convertScaleAbs(roi, alpha=1.35, beta=8)
-    roi = cv2.GaussianBlur(roi, (3, 3), 0)
-    variants = []
+    roi = cv2.convertScaleAbs(roi, alpha=1.4, beta=10)
+    variants = [roi]
     _, otsu = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(otsu)
     variants.append(cv2.bitwise_not(otsu))
+    variants.append(
+        cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8)
+    )
     return variants
 
 
@@ -1567,7 +1611,7 @@ def _ocr_single_roi(
     bbox: Tuple[int, int, int, int],
     results: List[OCRResult],
     frame_shape: Tuple[int, int],
-    fast: bool = True,
+    fast: bool = False,
 ) -> None:
     if pytesseract is None or cv2 is None:
         return
@@ -1591,9 +1635,14 @@ def _ocr_single_roi(
             except Exception:
                 continue
             raw_stripped = raw_txt.strip().upper()
+            if not raw_stripped:
+                continue
             cleaned = clean_ocr_text(raw_txt)
             matched = match_known_sign_text(raw_txt)
             final_text = pick_ocr_final_text(cleaned, matched)
+            known_hit = extract_known_sign_from_text(raw_txt) or extract_known_sign_from_text(cleaned)
+            if known_hit:
+                final_text = known_hit
             if not final_text or not is_valid_sign_text(final_text):
                 continue
             if final_text in seen:
@@ -1601,10 +1650,10 @@ def _ocr_single_roi(
             seen.add(final_text)
             score = score_ocr_result(final_text, (x1, y1, x2, y2), frame_shape)
             centre = get_centre_ocr_box(frame_shape[1], frame_shape[0])
-            if _bbox_overlap_ratio((x1, y1, x2, y2), centre) > 0.25:
-                score = min(1.0, score + 0.12)
+            if _bbox_overlap_ratio((x1, y1, x2, y2), centre) > 0.20:
+                score = min(1.0, score + 0.15)
             if is_known_sign_word(final_text):
-                score = min(1.0, score + 0.08)
+                score = min(1.0, score + 0.15)
             if score < OCR_MIN_CONFIDENCE_SCORE:
                 continue
             results.append(OCRResult(
@@ -1612,15 +1661,14 @@ def _ocr_single_roi(
                 confidence=score,
                 bbox=(x1, y1, x2, y2),
                 timestamp=time.time(),
-                raw_text=raw_stripped[:40],
-                cleaned_text=cleaned,
+                raw_text=raw_stripped[:60],
+                cleaned_text=cleaned or final_text,
                 matched_text=final_text,
                 score=score,
             ))
             ocr_log_rows.append([
                 round(time.time(), 3), final_text, f"{score:.3f}", x1, y1, x2, y2,
             ])
-            # Early exit on strong known-sign hit
             if score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(final_text):
                 return
 
@@ -1630,21 +1678,21 @@ def find_color_sign_rois(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int
     if cv2 is None:
         return []
     h, w = frame_bgr.shape[:2]
-    upper = frame_bgr[0 : max(1, int(h * 0.55)), :]
+    upper = frame_bgr[0 : max(1, int(h * 0.60)), :]
     rois: List[Tuple[int, int, int, int]] = []
     hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
-    red1 = cv2.inRange(hsv, (0, 80, 70), (12, 255, 255))
-    red2 = cv2.inRange(hsv, (165, 80, 70), (180, 255, 255))
+    red1 = cv2.inRange(hsv, (0, 70, 60), (14, 255, 255))
+    red2 = cv2.inRange(hsv, (160, 70, 60), (180, 255, 255))
     red_mask = cv2.bitwise_or(red1, red2)
     gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
-    _, bright = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    _, bright = cv2.threshold(gray, 185, 255, cv2.THRESH_BINARY)
     for mask in (red_mask, bright):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw * bh < 400 or bw < 20 or bh < 12:
+            if bw * bh < 350 or bw < 18 or bh < 10:
                 continue
-            pad = 6
+            pad = 8
             rois.append((
                 max(0, x - pad),
                 max(0, y - pad),
@@ -1662,43 +1710,38 @@ def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List
     gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     centre = get_centre_ocr_box(w, h)
 
-    # Pass 1: centre yellow box only (fast + most accurate when sign is aimed correctly)
     results: List[OCRResult] = []
-    _ocr_single_roi(gray_full, centre, results, frame_shape, fast=True)
+    _ocr_single_roi(gray_full, centre, results, frame_shape, fast=False)
     if results:
         best = max(results, key=lambda r: r.score)
-        if best.score >= OCR_EARLY_EXIT_SCORE or (
-            is_known_sign_word(best.text) and best.score >= OCR_MANUAL_CONFIRM_SCORE
-        ):
+        if best.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(best.text):
             results.sort(key=lambda r: (-r.score, -r.confidence))
             return results[:3]
 
-    if OCR_CENTRE_FIRST_ONLY and results:
-        results.sort(key=lambda r: (-r.score, -r.confidence))
-        return results[:3]
-
-    # Pass 2: optional extra ROIs only if centre found nothing useful
-    extra_rois: List[Tuple[int, int, int, int]] = []
-    sign_like = ("sign", "stop", "exit", "text", "poster")
-    for d in detections:
-        if any(s in d.label.lower() for s in sign_like):
-            extra_rois.append(d.bbox)
-    extra_rois.extend(find_color_sign_rois(frame_bgr))
-    if not OCR_CENTRE_FIRST_ONLY:
+    need_more = (not results) or (max(r.score for r in results) < OCR_EARLY_EXIT_SCORE)
+    if need_more:
+        extra_rois: List[Tuple[int, int, int, int]] = []
+        sign_like = ("sign", "stop", "exit", "text", "poster")
+        for d in detections:
+            if any(s in d.label.lower() for s in sign_like):
+                extra_rois.append(d.bbox)
+        extra_rois.extend(find_color_sign_rois(frame_bgr))
         extra_rois.append(get_upper_ocr_box(w, h))
-    if OCR_WHOLE_FRAME_FALLBACK:
-        extra_rois.append((0, 0, w, h))
+        if OCR_WHOLE_FRAME_FALLBACK:
+            extra_rois.append((0, 0, w, h))
 
-    seen_boxes: set = set()
-    seen_boxes.add((centre[0] // 20, centre[1] // 20, centre[2] // 20, centre[3] // 20))
-    for box in extra_rois[:OCR_MAX_EXTRA_ROIS]:
-        key = (box[0] // 20, box[1] // 20, box[2] // 20, box[3] // 20)
-        if key in seen_boxes:
-            continue
-        seen_boxes.add(key)
-        _ocr_single_roi(gray_full, box, results, frame_shape, fast=True)
-        if results and max(r.score for r in results) >= OCR_EARLY_EXIT_SCORE:
-            break
+        seen_boxes: set = set()
+        seen_boxes.add((centre[0] // 20, centre[1] // 20, centre[2] // 20, centre[3] // 20))
+        for box in extra_rois[:OCR_MAX_EXTRA_ROIS]:
+            key = (box[0] // 20, box[1] // 20, box[2] // 20, box[3] // 20)
+            if key in seen_boxes:
+                continue
+            seen_boxes.add(key)
+            _ocr_single_roi(gray_full, box, results, frame_shape, fast=True)
+            if results:
+                top = max(results, key=lambda r: r.score)
+                if top.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(top.text):
+                    break
 
     results.sort(key=lambda r: (-r.score, -r.confidence))
     return results[:5]
@@ -1765,13 +1808,12 @@ def apply_ocr_scan_results(new_items: List[OCRResult], manual: bool = False) -> 
 
     if vote_count >= OCR_REQUIRE_STABLE_READS:
         confirm_sign_text(vote_text, speak_now=True)
-    elif manual and vote_text and is_valid_sign_text(vote_text) and best.score >= OCR_MANUAL_CONFIRM_SCORE:
+    elif manual and vote_text and is_valid_sign_text(vote_text):
         confirm_sign_text(vote_text, speak_now=True)
         print(f"Manual OCR confirmed: {vote_text} (score={best.score:.2f})")
     elif (
         not manual
-        and vote_count >= 1
-        and is_valid_sign_text(vote_text)
+        and is_known_sign_word(vote_text)
         and best.score >= OCR_AUTO_SINGLE_READ_SCORE
     ):
         confirm_sign_text(vote_text, speak_now=True)
@@ -2394,7 +2436,7 @@ def draw_camera_overlays(frame_bgr: np.ndarray, dets: List[Detection], ocr_items
         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA,
     )
     cv2.putText(
-        out, "Hold sign in yellow box — 2 scans (~4s) or press R",
+        out, "Hold sign in yellow box — press R to read now",
         (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA,
     )
 
