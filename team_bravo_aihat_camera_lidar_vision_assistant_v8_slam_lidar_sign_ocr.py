@@ -184,8 +184,8 @@ CAMERA_OBJECT_REPEAT_SECONDS = 10.0
 
 # LiDAR obstacle voice — confirm faster; do not clear on one CLEAR frame
 LIDAR_CONFIRM_SCANS = 4
-OBSTACLE_REPEAT_SECONDS = 7.0
-VERY_CLOSE_REPEAT_SECONDS = 7.0
+OBSTACLE_REPEAT_SECONDS = 10.0
+VERY_CLOSE_REPEAT_SECONDS = 10.0
 
 # SLAM-style LiDAR point-cloud panel (visual only — D6 remains 2D)
 SLAM_LIDAR_HISTORY_SCANS = 40
@@ -969,7 +969,7 @@ def confirm_sign_text(text: str, speak_now: bool = True) -> None:
             text != last_spoken_sign_text
             or (now - last_sign_voice_time) >= OCR_VOICE_REPEAT_SECONDS
         ):
-            speak_chosen_message(build_sign_speech(text), "sign", text, False)
+            speak_chosen_message(build_sign_speech(text), "sign", text, True)
 
 
 def matching_camera_object(
@@ -1053,9 +1053,18 @@ def choose_voice_message(
 ) -> Optional[Tuple[str, str, str, bool]]:
     """
     Return one voice message: (spoken_text, category_key, voice_track_key, interrupt).
-    Priority: VERY_CLOSE > sign > STRONG > lidar normal > camera object > path clear.
+    Priority: OCR sign > VERY_CLOSE > STRONG > lidar normal > camera object > path clear.
     """
     now = time.time()
+
+    # Sign text has priority over all obstacle warnings when due to speak
+    if confirmed_sign_text:
+        if (
+            confirmed_sign_text != last_spoken_sign_text
+            or (now - last_sign_voice_time) >= OCR_VOICE_REPEAT_SECONDS
+        ):
+            msg = build_sign_speech(confirmed_sign_text)
+            return msg, "sign", confirmed_sign_text, True
 
     if confirmed_lidar_alert.startswith("VERY_CLOSE_"):
         if (
@@ -1065,14 +1074,6 @@ def choose_voice_message(
             obj = matching_camera_object(confirmed_lidar_alert, detections, frame_w)
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
             return msg, "lidar_very_close", confirmed_lidar_alert, True
-
-    if confirmed_sign_text and not confirmed_lidar_alert.startswith("VERY_CLOSE_"):
-        if (
-            confirmed_sign_text != last_spoken_sign_text
-            or (now - last_sign_voice_time) >= OCR_VOICE_REPEAT_SECONDS
-        ):
-            msg = build_sign_speech(confirmed_sign_text)
-            return msg, "sign", confirmed_sign_text, False
 
     if confirmed_lidar_alert.startswith("STRONG_"):
         if (
@@ -1125,7 +1126,7 @@ def speak_chosen_message(
 
     if not voice_enabled:
         return False
-    if interrupt or category == "lidar_very_close":
+    if interrupt or category in ("sign", "lidar_very_close"):
         if is_voice_speaking():
             stop_current_voice()
     ok = run_tts(spoken_text)
@@ -1157,10 +1158,10 @@ def speak_chosen_message(
 
 
 def display_alert_summary() -> str:
-    if confirmed_lidar_alert != "CLEAR":
-        return confirmed_lidar_alert
     if confirmed_sign_text:
         return f"SIGN:{confirmed_sign_text}"
+    if confirmed_lidar_alert != "CLEAR":
+        return confirmed_lidar_alert
     if confirmed_object_label:
         return f"OBJ:{confirmed_object_label}"
     return "CLEAR"
@@ -3173,7 +3174,7 @@ def main() -> None:
     pygame.init()
     pygame.display.set_caption("Team Bravo Vision Assistant v8 SLAM LiDAR + sign OCR")
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
-    print("Pi 5 v8: SLAM LiDAR view | obstacle voice 7s | R=read sign | C=retry | D=debug")
+    print("Pi 5 v8: SLAM LiDAR | sign voice priority | obstacle voice 10s | R=read sign | D=debug")
 
     if voice_enabled:
         pygame.time.wait(300)
