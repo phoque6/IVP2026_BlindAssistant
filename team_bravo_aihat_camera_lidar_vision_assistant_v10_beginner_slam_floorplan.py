@@ -116,21 +116,37 @@ CAMERA_RETRY_SECONDS = 3.0
 CAMERA_FREEZE_SECONDS = 2.0
 SHOW_CAMERA_ERROR_PANEL = True
 
+AI_MODELS_DIR = "models"
 AI_MODEL_PATH = "models/yolov8n.hef"
 AI_LABELS_PATH = "models/coco_labels.txt"
 AI_DNN_MODEL_PATH = "models/yolov8n.onnx"
-AI_CONFIDENCE_THRESHOLD = 0.45
-AI_NMS_THRESHOLD = 0.40
+AI_CONFIDENCE_THRESHOLD = 0.28
+AI_NMS_THRESHOLD = 0.45
 AI_PROCESS_WIDTH = 416
 AI_PROCESS_HEIGHT = 312
-DNN_EVERY_N_FRAMES = 8
+AI_DNN_INPUT_SIZE = 640
+DNN_EVERY_N_FRAMES = 1  # try DNN every AI cycle when model exists
+
+# Fallback COCO-80 names if labels file is missing
+COCO_DEFAULT_LABELS = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
+    "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+]
 
 # Time-based camera processing (decoupled from capture rate)
-OCR_INTERVAL_SECONDS = 2.5
-OCR_VOICE_REPEAT_SECONDS = 5.0
-OCR_PERSIST_SECONDS = 10.0
-OCR_FRAME_SCALE = 2.5
-AI_DETECTION_INTERVAL_SECONDS = 0.5
+OCR_INTERVAL_SECONDS = 1.6
+OCR_VOICE_REPEAT_SECONDS = 6.0
+OCR_PERSIST_SECONDS = 14.0
+OCR_FRAME_SCALE = 3.2
+AI_DETECTION_INTERVAL_SECONDS = 0.40
 CAMERA_SLEEP_SECONDS = 0.001
 
 OCR_MIN_TEXT_LENGTH = 2
@@ -140,10 +156,10 @@ OCR_WHOLE_FRAME_FALLBACK = False
 # Vocabulary corrects common signs (EX1T->EXIT) but does NOT block unknown text
 OCR_USE_SIGN_VOCABULARY = False
 OCR_VOCABULARY_CORRECTION = True
-OCR_MIN_CONFIDENCE_SCORE = 0.28
+OCR_MIN_CONFIDENCE_SCORE = 0.20
 OCR_REQUIRE_STABLE_READS = 1
-OCR_MANUAL_CONFIRM_SCORE = 0.30
-OCR_AUTO_SINGLE_READ_SCORE = 0.50
+OCR_MANUAL_CONFIRM_SCORE = 0.22
+OCR_AUTO_SINGLE_READ_SCORE = 0.36
 OCR_STABLE_WINDOW_SECONDS = 12.0
 OCR_FUZZY_MATCH_THRESHOLD = 0.70
 OCR_VOCAB_MAX_WORDS = 3
@@ -151,12 +167,17 @@ OCR_VOCAB_MAX_CHARS = 18
 STREET_NAME_HINTS = (
     "ROAD", "STREET", "ST", "AVE", "AVENUE", "LANE", "DRIVE", "DR",
     "BLVD", "BOULEVARD", "WAY", "PLACE", "PL", "COURT", "CT", "CRESCENT",
-    "HIGHWAY", "HWY", "CLOSE", "WALK", "PATH", "BRIDGE",
+    "HIGHWAY", "HWY", "CLOSE", "WALK", "PATH", "BRIDGE", "JALAN", "LORONG",
+)
+STREET_NAME_COMPACT_HINTS = (
+    "AVENUE", "STREET", "ROAD", "AVE", "LANE", "DRIVE", "CRESCENT",
+    "BOULEVARD", "HIGHWAY", "JALAN", "LORONG",
 )
 # Centre first, but always fall back to extra ROIs if centre is weak
 OCR_CENTRE_FIRST_ONLY = False
-OCR_MAX_EXTRA_ROIS = 4
+OCR_MAX_EXTRA_ROIS = 8
 OCR_EARLY_EXIT_SCORE = 0.70
+OCR_STREET_EARLY_EXIT_SCORE = 0.48
 
 KNOWN_SIGN_WORDS = [
     "EXIT",
@@ -190,9 +211,9 @@ SIGN_CONFIRM_DETECTIONS = 1
 SIGN_REPEAT_SECONDS = 5.0
 
 # Camera object voice — announce useful objects around the user
-CAMERA_OBJECT_CONFIRM_DETECTIONS = 3
-CAMERA_OBJECT_REPEAT_SECONDS = 12.0
-CAMERA_OBJECT_MAX_ANNOUNCE = 4
+CAMERA_OBJECT_CONFIRM_DETECTIONS = 2
+CAMERA_OBJECT_REPEAT_SECONDS = 10.0
+CAMERA_OBJECT_MAX_ANNOUNCE = 3
 
 # LiDAR obstacle voice — confirm faster; do not clear on one CLEAR frame
 LIDAR_CONFIRM_SCANS = 4
@@ -224,9 +245,11 @@ SLAM_ACCEPT_MEAN_ERR_M = 0.35
 CLEAR_CONFIRM_SCANS = 6
 CLEAR_REPEAT_SECONDS = 20.0
 
-ESPEAK_SPEED = 155
-ESPEAK_AMPLITUDE = 180
-ESPEAK_WORD_GAP_MS = 6
+ESPEAK_SPEED = 118
+ESPEAK_AMPLITUDE = 200
+ESPEAK_WORD_GAP_MS = 16
+ESPEAK_PITCH = 42
+ESPEAK_VOICE = "en"
 
 USEFUL_OBJECT_LABELS = (
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "bench",
@@ -440,7 +463,7 @@ hog_detector = None
 
 def load_labels(path: str) -> List[str]:
     if not os.path.isfile(path):
-        return []
+        return list(COCO_DEFAULT_LABELS)
     labels = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -449,8 +472,103 @@ def load_labels(path: str) -> List[str]:
                 if txt:
                     labels.append(txt)
     except OSError:
+        return list(COCO_DEFAULT_LABELS)
+    return labels or list(COCO_DEFAULT_LABELS)
+
+
+def _pick_first_existing(candidates: List[str]) -> Optional[str]:
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _list_model_files(ext: str) -> List[str]:
+    if not os.path.isdir(AI_MODELS_DIR):
         return []
-    return labels
+    files = []
+    try:
+        for name in sorted(os.listdir(AI_MODELS_DIR)):
+            if name.lower().endswith(ext.lower()):
+                files.append(os.path.join(AI_MODELS_DIR, name))
+    except OSError:
+        return []
+    return files
+
+
+def resolve_ai_model_paths() -> None:
+    """
+    Auto-detect HEF/ONNX/labels in models/ so Pi downloads like
+    yolov8s_h8l.hef work without renaming to yolov8n.hef.
+    """
+    global AI_MODEL_PATH, AI_DNN_MODEL_PATH, AI_LABELS_PATH
+    os.makedirs(AI_MODELS_DIR, exist_ok=True)
+
+    hef_files = _list_model_files(".hef")
+    onnx_files = _list_model_files(".onnx")
+    label_candidates = [
+        os.path.join(AI_MODELS_DIR, "coco_labels.txt"),
+        os.path.join(AI_MODELS_DIR, "coco.names"),
+        os.path.join(AI_MODELS_DIR, "labels.txt"),
+        os.path.join(AI_MODELS_DIR, "coco.txt"),
+    ]
+    for path in _list_model_files(".txt") + _list_model_files(".names"):
+        low = os.path.basename(path).lower()
+        if "coco" in low or "label" in low or low.endswith(".names"):
+            if path not in label_candidates:
+                label_candidates.append(path)
+
+    preferred_hef = [
+        os.path.join(AI_MODELS_DIR, "yolov8n.hef"),
+        os.path.join(AI_MODELS_DIR, "yolov8s_h8l.hef"),
+        os.path.join(AI_MODELS_DIR, "yolov8s.hef"),
+        os.path.join(AI_MODELS_DIR, "yolov8m.hef"),
+        os.path.join(AI_MODELS_DIR, "yolov11n.hef"),
+        os.path.join(AI_MODELS_DIR, "yolov11s.hef"),
+    ]
+    # Prefer nano/small Hailo-8L names from directory listing
+    for path in hef_files:
+        low = os.path.basename(path).lower()
+        if "yolov8n" in low or "yolo8n" in low:
+            preferred_hef.insert(0, path)
+        elif "h8l" in low and "yolo" in low:
+            preferred_hef.append(path)
+        elif "yolo" in low:
+            preferred_hef.append(path)
+    preferred_hef.extend(hef_files)
+
+    preferred_onnx = [
+        os.path.join(AI_MODELS_DIR, "yolov8n.onnx"),
+        os.path.join(AI_MODELS_DIR, "yolov8s.onnx"),
+    ]
+    for path in onnx_files:
+        low = os.path.basename(path).lower()
+        if "yolov8n" in low:
+            preferred_onnx.insert(0, path)
+        else:
+            preferred_onnx.append(path)
+    preferred_onnx.extend(onnx_files)
+
+    hef = _pick_first_existing(preferred_hef)
+    onnx = _pick_first_existing(preferred_onnx)
+    labels = _pick_first_existing(label_candidates)
+
+    if hef:
+        AI_MODEL_PATH = hef
+    if onnx:
+        AI_DNN_MODEL_PATH = onnx
+    if labels:
+        AI_LABELS_PATH = labels
+
+    print("AI model paths:")
+    print(f"- models dir: {os.path.abspath(AI_MODELS_DIR)}")
+    print(f"- HEF:  {AI_MODEL_PATH} ({'OK' if os.path.isfile(AI_MODEL_PATH) else 'MISSING'})")
+    print(f"- ONNX: {AI_DNN_MODEL_PATH} ({'OK' if os.path.isfile(AI_DNN_MODEL_PATH) else 'MISSING'})")
+    print(f"- Labels: {AI_LABELS_PATH} ({'OK' if os.path.isfile(AI_LABELS_PATH) else 'using built-in COCO-80'})")
+    if hef_files or onnx_files:
+        print(f"- Found in models/: {[os.path.basename(p) for p in hef_files + onnx_files]}")
+    else:
+        print("- No .hef/.onnx found yet. Place them in the models/ folder next to this script.")
 
 
 def list_serial_ports() -> List[str]:
@@ -963,14 +1081,15 @@ def _run_tts_windows(text: str) -> bool:
             ps = (
                 "Add-Type -AssemblyName System.Speech; "
                 "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                "$s.Rate = 0; "
+                "$s.Rate = -2; "
+                "$s.Volume = 100; "
                 f"$s.Speak('{safe}')"
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=20,
+                timeout=25,
                 check=False,
             )
         except Exception as exc:
@@ -983,6 +1102,22 @@ def _run_tts_windows(text: str) -> bool:
     return True
 
 
+def clarify_speech_text(text: str) -> str:
+    """Slow spoken phrases slightly for clearer assistive feedback."""
+    t = " ".join(text.split())
+    # Prefer full word Avenue when reading street signs
+    t = re.sub(r"\bAve\b", "Avenue", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bSt\b", "Street", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bRd\b", "Road", t, flags=re.IGNORECASE)
+    # Brief pause markers for espeak/Windows (" - " helps)
+    if t.lower().startswith("sign says "):
+        body = t[10:]
+        parts = body.split()
+        if len(parts) >= 3:
+            t = "Sign says. " + ". ".join(parts)
+    return t
+
+
 def run_tts(text: str, force: bool = False) -> bool:
     """Speak text. force=True bypasses voice_enabled and temporary mute (for tests)."""
     global current_voice_process
@@ -991,13 +1126,17 @@ def run_tts(text: str, force: bool = False) -> bool:
     if not tts_checked:
         init_voice_system()
 
+    spoken = clarify_speech_text(text)
+
     if tts_backend == "espeak" and tts_executable:
         args = [
             tts_executable,
+            "-v", ESPEAK_VOICE,
             "-s", str(ESPEAK_SPEED),
             "-a", str(ESPEAK_AMPLITUDE),
             "-g", str(ESPEAK_WORD_GAP_MS),
-            text,
+            "-p", str(ESPEAK_PITCH),
+            spoken,
         ]
         try:
             current_voice_process = subprocess.Popen(
@@ -1009,9 +1148,9 @@ def run_tts(text: str, force: bool = False) -> bool:
             return False
 
     if tts_backend == "windows":
-        return _run_tts_windows(text)
+        return _run_tts_windows(spoken)
 
-    print(f"[VOICE] {text}")
+    print(f"[VOICE] {spoken}")
     print("\a", end="", flush=True)
     return True
 
@@ -1348,10 +1487,10 @@ def matching_camera_object(
 def build_object_speech(label: str, direction: str) -> str:
     obj = normalize_object_label(label)
     if direction == "LEFT":
-        return f"{obj} on your left"
+        return f"{obj}, on your left"
     if direction == "RIGHT":
-        return f"{obj} on your right"
-    return f"{obj} ahead"
+        return f"{obj}, on your right"
+    return f"{obj}, ahead"
 
 
 def build_surroundings_speech(items: List[Tuple[str, str]]) -> str:
@@ -1409,13 +1548,24 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
 def build_sign_speech(text: str) -> str:
     compact = text.replace(" ", "")
     if compact.isdigit():
-        return f"Number {text}"
+        return "Number " + " ".join(list(compact))
     alpha = sum(1 for c in compact if c.isalpha())
     digit = sum(1 for c in compact if c.isdigit())
     if digit >= 1 and alpha <= 2:
-        return f"Number {text}"
+        return "Number " + " ".join(list(compact))
     words = text.title().split()
-    return f"Sign says {' '.join(words)}"
+    expanded = []
+    for w in words:
+        low = w.lower()
+        if low == "ave":
+            expanded.append("Avenue")
+        elif low == "st":
+            expanded.append("Street")
+        elif low == "rd":
+            expanded.append("Road")
+        else:
+            expanded.append(w)
+    return "Sign says " + " ".join(expanded)
 
 
 def choose_voice_message(
@@ -1466,7 +1616,7 @@ def choose_voice_message(
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
             return msg, "lidar_normal", confirmed_lidar_alert, False
 
-    if confirmed_surroundings and confirmed_lidar_alert == "CLEAR":
+    if confirmed_surroundings and not confirmed_lidar_alert.startswith(("VERY_CLOSE_", "STRONG_")):
         alert_key = ";".join(
             f"{normalize_object_label(l)}:{d}" for l, d in confirmed_surroundings
         )
@@ -1588,6 +1738,10 @@ def print_camera_settings() -> None:
     print(f"- ACTIVE_USB_CAMERA_INDEX: {ACTIVE_USB_CAMERA_INDEX}")
     print(f"- OCR_INTERVAL_SECONDS: {OCR_INTERVAL_SECONDS}")
     print(f"- AI_DETECTION_INTERVAL_SECONDS: {AI_DETECTION_INTERVAL_SECONDS}")
+    print(f"- AI DNN model path: {AI_DNN_MODEL_PATH} "
+          f"({'FOUND' if os.path.isfile(AI_DNN_MODEL_PATH) else 'MISSING — using HOG/sign/contour fallback'})")
+    print(f"- Hailo model path: {AI_MODEL_PATH} "
+          f"({'FOUND' if os.path.isfile(AI_MODEL_PATH) else 'MISSING'})")
     print("View: 0=quad | 1=camera | 2=zones | 3=LiDAR | 4=floor-plan | Z=zones overlay | F=fullscreen")
     print("Camera: C=retry | X=on/off | P=USB/PiCam priority | R=read sign now | M=reset SLAM map | N=mute 30s")
     print("Troubleshooting:")
@@ -1701,9 +1855,12 @@ def is_number_like_text(text: str) -> bool:
 
 def looks_like_street_name(text: str) -> bool:
     words = text.upper().split()
+    compact = text.upper().replace(" ", "")
     if len(words) >= 2 and any(w in STREET_NAME_HINTS for w in words):
         return True
-    if len(words) >= 2 and len(text.replace(" ", "")) >= 8:
+    if any(h in compact for h in STREET_NAME_COMPACT_HINTS) and len(compact) >= 6:
+        return True
+    if len(words) >= 2 and len(compact) >= 8:
         return True
     return False
 
@@ -1983,9 +2140,16 @@ def _bbox_overlap_ratio(
     return inter / a_area
 
 
-def _ocr_tesseract_configs(fast: bool = False) -> List[str]:
-    """Sign-friendly Tesseract configs."""
+def _ocr_tesseract_configs(fast: bool = False, street_line: bool = False) -> List[str]:
+    """Sign-friendly Tesseract configs. street_line prioritises single horizontal lines."""
     whitelist = " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    if street_line:
+        return [
+            f"--oem 3 --psm 7{whitelist}",
+            f"--oem 3 --psm 6{whitelist}",
+            f"--oem 3 --psm 7",
+            f"--oem 3 --psm 13{whitelist}",
+        ]
     if fast:
         return [
             f"--oem 3 --psm 7{whitelist}",
@@ -2009,11 +2173,11 @@ def _prepare_ocr_variants(gray_roi: np.ndarray) -> List[np.ndarray]:
         return [gray_roi]
     roi = gray_roi
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         roi = clahe.apply(roi)
     except Exception:
         pass
-    roi = cv2.convertScaleAbs(roi, alpha=1.4, beta=10)
+    roi = cv2.convertScaleAbs(roi, alpha=1.5, beta=8)
     variants = [roi]
     _, otsu = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(otsu)
@@ -2024,12 +2188,59 @@ def _prepare_ocr_variants(gray_roi: np.ndarray) -> List[np.ndarray]:
     return variants
 
 
+def _prepare_color_sign_variants(
+    frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int]
+) -> List[np.ndarray]:
+    """Extra variants for white-on-green / coloured street signs."""
+    if cv2 is None or frame_bgr is None:
+        return []
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 12 or y2 - y1 < 8:
+        return []
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return []
+    scale = max(2.5, OCR_FRAME_SCALE)
+    crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    variants: List[np.ndarray] = []
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    try:
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    except Exception:
+        pass
+    variants.append(gray)
+    # White-on-green: boost brightness where colour is pale
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 160), (180, 80, 255))
+    variants.append(white)
+    variants.append(cv2.bitwise_not(white))
+    # Green-channel difference (text often brighter than green paint)
+    _b, g, _r = cv2.split(crop)
+    mix = cv2.normalize(cv2.subtract(gray, cv2.divide(g, 3)), None, 0, 255, cv2.NORM_MINMAX)
+    variants.append(mix)
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(otsu)
+    variants.append(cv2.bitwise_not(otsu))
+    return variants
+
+
+def _bbox_is_street_line(bbox: Tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = bbox
+    w, h = max(1, x2 - x1), max(1, y2 - y1)
+    return w >= 80 and (w / float(h)) >= 2.2
+
+
 def _ocr_single_roi(
     gray: np.ndarray,
     bbox: Tuple[int, int, int, int],
     results: List[OCRResult],
     frame_shape: Tuple[int, int],
     fast: bool = False,
+    frame_bgr: Optional[np.ndarray] = None,
 ) -> None:
     if pytesseract is None or cv2 is None:
         return
@@ -2044,86 +2255,170 @@ def _ocr_single_roi(
         return
     scale = max(2.0, OCR_FRAME_SCALE)
     roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    variants = _prepare_ocr_variants(roi)
+    street_line = _bbox_is_street_line((x1, y1, x2, y2))
+    variants = _prepare_color_sign_variants(frame_bgr, (x1, y1, x2, y2)) if frame_bgr is not None else []
+    variants.extend(_prepare_ocr_variants(roi))
     seen: set = set()
+    configs = _ocr_tesseract_configs(fast=fast, street_line=street_line)
+
+    def _consider_raw(raw_txt: str) -> None:
+        raw_stripped = raw_txt.strip().upper()
+        if not raw_stripped:
+            return
+        cleaned = clean_ocr_text(raw_txt)
+        matched = match_known_sign_text(raw_txt)
+        final_text = pick_ocr_final_text(cleaned, matched)
+        known_hit = extract_known_sign_from_text(raw_txt) or extract_known_sign_from_text(cleaned)
+        if known_hit:
+            if not final_text:
+                final_text = known_hit
+            elif should_apply_vocab_correction(final_text) and is_known_sign_word(known_hit):
+                final_text = known_hit
+        if not final_text or not is_valid_sign_text(final_text):
+            return
+        if final_text in seen:
+            return
+        seen.add(final_text)
+        score = score_ocr_result(final_text, (x1, y1, x2, y2), frame_shape)
+        centre = get_centre_ocr_box(frame_shape[1], frame_shape[0])
+        if _bbox_overlap_ratio((x1, y1, x2, y2), centre) > 0.20:
+            score = min(1.0, score + 0.15)
+        if is_known_sign_word(final_text):
+            score = min(1.0, score + 0.15)
+        if is_number_like_text(final_text) or looks_like_street_name(final_text):
+            score = min(1.0, score + 0.18)
+        if street_line and looks_like_street_name(final_text):
+            score = min(1.0, score + 0.10)
+        if score < OCR_MIN_CONFIDENCE_SCORE:
+            return
+        results.append(OCRResult(
+            text=final_text,
+            confidence=score,
+            bbox=(x1, y1, x2, y2),
+            timestamp=time.time(),
+            raw_text=raw_stripped[:80],
+            cleaned_text=cleaned or final_text,
+            matched_text=final_text,
+            score=score,
+        ))
+        ocr_log_rows.append([
+            round(time.time(), 3), final_text, f"{score:.3f}", x1, y1, x2, y2,
+        ])
+
     for img in variants:
-        for cfg in _ocr_tesseract_configs(fast=fast):
+        # Word-level OCR reconstructs street lines better than whole-block string
+        if not fast:
+            try:
+                data = pytesseract.image_to_data(
+                    img,
+                    config="--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                    output_type=pytesseract.Output.DICT,
+                )
+                words = []
+                for i, txt in enumerate(data.get("text", [])):
+                    conf = int(float(data["conf"][i])) if str(data["conf"][i]).lstrip("-").isdigit() else -1
+                    t = (txt or "").strip()
+                    if conf >= 35 and t:
+                        words.append(t.upper())
+                if words:
+                    _consider_raw(" ".join(words))
+            except Exception:
+                pass
+        for cfg in configs:
             try:
                 raw_txt = pytesseract.image_to_string(img, config=cfg)
             except Exception:
                 continue
-            raw_stripped = raw_txt.strip().upper()
-            if not raw_stripped:
-                continue
-            cleaned = clean_ocr_text(raw_txt)
-            matched = match_known_sign_text(raw_txt)
-            final_text = pick_ocr_final_text(cleaned, matched)
-            known_hit = extract_known_sign_from_text(raw_txt) or extract_known_sign_from_text(cleaned)
-            # Do not overwrite numbers / street names with a short vocabulary word
-            if known_hit:
-                if not final_text:
-                    final_text = known_hit
-                elif should_apply_vocab_correction(final_text) and is_known_sign_word(known_hit):
-                    final_text = known_hit
-            if not final_text or not is_valid_sign_text(final_text):
-                continue
-            if final_text in seen:
-                continue
-            seen.add(final_text)
-            score = score_ocr_result(final_text, (x1, y1, x2, y2), frame_shape)
-            centre = get_centre_ocr_box(frame_shape[1], frame_shape[0])
-            if _bbox_overlap_ratio((x1, y1, x2, y2), centre) > 0.20:
-                score = min(1.0, score + 0.15)
-            if is_known_sign_word(final_text):
-                score = min(1.0, score + 0.15)
-            if is_number_like_text(final_text) or looks_like_street_name(final_text):
-                score = min(1.0, score + 0.10)
-            if score < OCR_MIN_CONFIDENCE_SCORE:
-                continue
-            results.append(OCRResult(
-                text=final_text,
-                confidence=score,
-                bbox=(x1, y1, x2, y2),
-                timestamp=time.time(),
-                raw_text=raw_stripped[:60],
-                cleaned_text=cleaned or final_text,
-                matched_text=final_text,
-                score=score,
-            ))
-            ocr_log_rows.append([
-                round(time.time(), 3), final_text, f"{score:.3f}", x1, y1, x2, y2,
-            ])
-            if score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(final_text):
-                return
+            _consider_raw(raw_txt)
+            if results:
+                top = max(results, key=lambda r: r.score)
+                if top.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(top.text):
+                    return
+                if top.score >= OCR_STREET_EARLY_EXIT_SCORE and looks_like_street_name(top.text):
+                    return
+
+
+def _append_mask_rois(
+    mask: np.ndarray,
+    rois: List[Tuple[int, int, int, int]],
+    frame_w: int,
+    frame_h: int,
+    y_offset: int = 0,
+    min_area: int = 400,
+    prefer_wide: bool = False,
+) -> None:
+    if cv2 is None:
+        return
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    scored: List[Tuple[float, Tuple[int, int, int, int]]] = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < min_area or bw < 24 or bh < 10:
+            continue
+        aspect = bw / float(max(1, bh))
+        if prefer_wide and aspect < 1.6:
+            continue
+        pad_x, pad_y = 10, 8
+        box = (
+            max(0, x - pad_x),
+            max(0, y + y_offset - pad_y),
+            min(frame_w, x + bw + pad_x),
+            min(frame_h, y + y_offset + bh + pad_y),
+        )
+        score = area * (1.4 if aspect >= 2.5 else 1.0)
+        scored.append((score, box))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    for _s, box in scored[:OCR_MAX_EXTRA_ROIS]:
+        rois.append(box)
 
 
 def find_color_sign_rois(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Find likely sign regions by colour (red STOP signs, bright white boards)."""
+    """Find sign regions: green street signs, red STOP, blue boards, bright panels."""
     if cv2 is None:
         return []
     h, w = frame_bgr.shape[:2]
-    upper = frame_bgr[0 : max(1, int(h * 0.60)), :]
+    upper_h = max(1, int(h * 0.75))
+    upper = frame_bgr[0:upper_h, :]
     rois: List[Tuple[int, int, int, int]] = []
     hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+
+    # Singapore-style green street name plates (wide, not tall foliage blobs)
+    green = cv2.inRange(hsv, (35, 50, 50), (95, 255, 255))
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, np.ones((5, 25), np.uint8))
+    green = cv2.morphologyEx(green, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    green_rois: List[Tuple[int, int, int, int]] = []
+    _append_mask_rois(green, green_rois, w, h, 0, min_area=600, prefer_wide=True)
+    for box in green_rois:
+        _x1, y1, _x2, y2 = box
+        if (y2 - y1) <= int(h * 0.28):  # reject tall tree blobs
+            rois.append(box)
+
+    # Red STOP / warning signs
     red1 = cv2.inRange(hsv, (0, 70, 60), (14, 255, 255))
     red2 = cv2.inRange(hsv, (160, 70, 60), (180, 255, 255))
     red_mask = cv2.bitwise_or(red1, red2)
+    _append_mask_rois(red_mask, rois, w, h, 0, min_area=350, prefer_wide=False)
+
+    # Blue information boards
+    blue = cv2.inRange(hsv, (95, 60, 50), (130, 255, 255))
+    _append_mask_rois(blue, rois, w, h, 0, min_area=450, prefer_wide=False)
+
+    # Bright white / pale boards
     gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
     _, bright = cv2.threshold(gray, 185, 255, cv2.THRESH_BINARY)
-    for mask in (red_mask, bright):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw * bh < 350 or bw < 18 or bh < 10:
-                continue
-            pad = 8
-            rois.append((
-                max(0, x - pad),
-                max(0, y - pad),
-                min(w, x + bw + pad),
-                min(h, y + bh + pad),
-            ))
-    return rois[:OCR_MAX_EXTRA_ROIS]
+    _append_mask_rois(bright, rois, w, h, 0, min_area=400, prefer_wide=False)
+
+    # Deduplicate
+    unique: List[Tuple[int, int, int, int]] = []
+    seen: set = set()
+    for box in rois:
+        key = (box[0] // 25, box[1] // 25, box[2] // 25, box[3] // 25)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(box)
+    return unique[:OCR_MAX_EXTRA_ROIS]
 
 
 def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List[OCRResult]:
@@ -2133,39 +2428,55 @@ def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List
     frame_shape = (h, w)
     gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     centre = get_centre_ocr_box(w, h)
-
     results: List[OCRResult] = []
-    _ocr_single_roi(gray_full, centre, results, frame_shape, fast=False)
-    if results:
+
+    def _good_enough() -> bool:
+        if not results:
+            return False
         best = max(results, key=lambda r: r.score)
         if best.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(best.text):
-            results.sort(key=lambda r: (-r.score, -r.confidence))
-            return results[:3]
+            return True
+        if best.score >= OCR_STREET_EARLY_EXIT_SCORE and looks_like_street_name(best.text):
+            return True
+        return False
 
-    need_more = (not results) or (max(r.score for r in results) < OCR_EARLY_EXIT_SCORE)
+    # 1) Coloured street-sign ROIs first (green Ave plates, etc.)
+    color_rois = find_color_sign_rois(frame_bgr)
+    for box in color_rois:
+        _ocr_single_roi(gray_full, box, results, frame_shape, fast=False, frame_bgr=frame_bgr)
+        if _good_enough():
+            results.sort(key=lambda r: (-r.score, -r.confidence))
+            return results[:5]
+
+    # 2) Centre hold-to-read box
+    _ocr_single_roi(gray_full, centre, results, frame_shape, fast=False, frame_bgr=frame_bgr)
+    if _good_enough():
+        results.sort(key=lambda r: (-r.score, -r.confidence))
+        return results[:5]
+
+    # 3) Detection boxes + upper band fallback
+    need_more = (not results) or (max(r.score for r in results) < OCR_STREET_EARLY_EXIT_SCORE)
     if need_more:
         extra_rois: List[Tuple[int, int, int, int]] = []
         sign_like = ("sign", "stop", "exit", "text", "poster")
         for d in detections:
             if any(s in d.label.lower() for s in sign_like):
                 extra_rois.append(d.bbox)
-        extra_rois.extend(find_color_sign_rois(frame_bgr))
         extra_rois.append(get_upper_ocr_box(w, h))
         if OCR_WHOLE_FRAME_FALLBACK:
             extra_rois.append((0, 0, w, h))
 
         seen_boxes: set = set()
-        seen_boxes.add((centre[0] // 20, centre[1] // 20, centre[2] // 20, centre[3] // 20))
+        for box in [centre] + color_rois:
+            seen_boxes.add((box[0] // 20, box[1] // 20, box[2] // 20, box[3] // 20))
         for box in extra_rois[:OCR_MAX_EXTRA_ROIS]:
             key = (box[0] // 20, box[1] // 20, box[2] // 20, box[3] // 20)
             if key in seen_boxes:
                 continue
             seen_boxes.add(key)
-            _ocr_single_roi(gray_full, box, results, frame_shape, fast=True)
-            if results:
-                top = max(results, key=lambda r: r.score)
-                if top.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(top.text):
-                    break
+            _ocr_single_roi(gray_full, box, results, frame_shape, fast=True, frame_bgr=frame_bgr)
+            if _good_enough():
+                break
 
     results.sort(key=lambda r: (-r.score, -r.confidence))
     return results[:5]
@@ -2237,8 +2548,12 @@ def apply_ocr_scan_results(new_items: List[OCRResult], manual: bool = False) -> 
         print(f"Manual OCR confirmed: {vote_text} (score={best.score:.2f})")
     elif (
         not manual
-        and is_known_sign_word(vote_text)
         and best.score >= OCR_AUTO_SINGLE_READ_SCORE
+        and (
+            is_known_sign_word(vote_text)
+            or looks_like_street_name(vote_text)
+            or is_number_like_text(vote_text)
+        )
     ):
         confirm_sign_text(vote_text, speak_now=True)
         print(f"High-confidence OCR confirmed: {vote_text} (score={best.score:.2f})")
@@ -2373,53 +2688,114 @@ def draw_ai_detections(frame_bgr: np.ndarray, detections: List[Detection]) -> np
 
 
 def detect_with_opencv_dnn(frame_bgr: np.ndarray) -> List[Detection]:
+    """Run YOLOv8 ONNX via OpenCV DNN (handles (1,84,N) output layout)."""
     global dnn_net
     if cv2 is None:
         return []
     if dnn_net is None and os.path.isfile(AI_DNN_MODEL_PATH):
         try:
             dnn_net = cv2.dnn.readNet(AI_DNN_MODEL_PATH)
-        except Exception:
+            print(f"OpenCV DNN loaded: {AI_DNN_MODEL_PATH}")
+        except Exception as exc:
+            print(f"OpenCV DNN load failed: {exc}")
             dnn_net = None
     if dnn_net is None:
         return []
+
     h, w = frame_bgr.shape[:2]
+    inp = AI_DNN_INPUT_SIZE
     try:
-        blob = cv2.dnn.blobFromImage(frame_bgr, 1 / 255.0, (640, 640), swapRB=True, crop=False)
+        blob = cv2.dnn.blobFromImage(
+            frame_bgr, 1 / 255.0, (inp, inp), swapRB=True, crop=False
+        )
         dnn_net.setInput(blob)
         outs = dnn_net.forward()
-    except Exception:
+    except Exception as exc:
+        print(f"OpenCV DNN forward failed: {exc}")
         return []
-    dets = []
-    out = outs[0] if isinstance(outs, (list, tuple)) and len(outs) else outs
-    if out is None or not hasattr(out, "shape"):
+
+    pred = outs[0] if isinstance(outs, (list, tuple)) and len(outs) else outs
+    if pred is None or not hasattr(pred, "shape"):
         return []
-    if len(out.shape) == 3:
-        out = out[0]
-    for row in out:
-        if len(row) < 6:
+    pred = np.asarray(pred)
+    if pred.ndim == 3:
+        pred = pred[0]
+    # YOLOv8: (84, 8400) -> (8400, 84); YOLOv5 may already be (N, 85)
+    if pred.ndim != 2:
+        return []
+    if pred.shape[0] < pred.shape[1] and pred.shape[0] <= 85:
+        pred = pred.T
+
+    boxes: List[List[int]] = []
+    confidences: List[float] = []
+    class_ids: List[int] = []
+    sx = w / float(inp)
+    sy = h / float(inp)
+
+    for row in pred:
+        row = np.asarray(row, dtype=np.float32).reshape(-1)
+        if row.size < 6:
             continue
-        conf = float(row[4])
+        # YOLOv8: [cx,cy,w,h, class0..class79]  (84 values)
+        # YOLOv5: [cx,cy,w,h, obj, class0..]   (85 values)
+        if row.size == 84 or (80 <= row.size <= 84):
+            class_scores = row[4:]
+            class_id = int(np.argmax(class_scores))
+            conf = float(class_scores[class_id])
+        else:
+            obj = float(row[4])
+            class_scores = row[5:]
+            if class_scores.size == 0:
+                continue
+            class_id = int(np.argmax(class_scores))
+            conf = obj * float(class_scores[class_id])
         if conf < AI_CONFIDENCE_THRESHOLD:
             continue
-        scores = row[5:]
-        class_id = int(np.argmax(scores)) if len(scores) else 0
-        cls_conf = float(scores[class_id]) if len(scores) else conf
-        final_conf = conf * cls_conf
-        if final_conf < AI_CONFIDENCE_THRESHOLD:
-            continue
-        cx, cy, bw, bh = row[0:4]
-        x1 = int((cx - bw / 2) * w / 640)
-        y1 = int((cy - bh / 2) * h / 640)
-        x2 = int((cx + bw / 2) * w / 640)
-        y2 = int((cy + bh / 2) * h / 640)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w - 1, x2), min(h - 1, y2)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        label = ai_labels[class_id] if class_id < len(ai_labels) else f"class_{class_id}"
-        dets.append(Detection(label, final_conf, (x1, y1, x2, y2), approximate_distance_from_bbox(w, (x1, y1, x2, y2)), "opencv_dnn", time.time()))
-    return dets
+
+        cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+        x1 = int((cx - bw / 2.0) * sx)
+        y1 = int((cy - bh / 2.0) * sy)
+        bw_i = int(bw * sx)
+        bh_i = int(bh * sy)
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        bw_i = max(1, min(w - x1, bw_i))
+        bh_i = max(1, min(h - y1, bh_i))
+        boxes.append([x1, y1, bw_i, bh_i])
+        confidences.append(conf)
+        class_ids.append(class_id)
+
+    if not boxes:
+        return []
+
+    try:
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, AI_CONFIDENCE_THRESHOLD, AI_NMS_THRESHOLD)
+    except Exception:
+        indices = list(range(len(boxes)))
+
+    dets: List[Detection] = []
+    if indices is None or len(indices) == 0:
+        return []
+    flat = np.array(indices).reshape(-1)
+    labels = ai_labels if ai_labels else COCO_DEFAULT_LABELS
+    for i in flat:
+        i = int(i)
+        x, y, bw_i, bh_i = boxes[i]
+        bbox = (x, y, x + bw_i, y + bh_i)
+        cid = class_ids[i]
+        label = labels[cid] if 0 <= cid < len(labels) else f"class_{cid}"
+        dets.append(
+            Detection(
+                label,
+                float(confidences[i]),
+                bbox,
+                approximate_distance_from_bbox(w, bbox),
+                "opencv_dnn",
+                time.time(),
+            )
+        )
+    dets.sort(key=lambda d: d.confidence, reverse=True)
+    return dets[:12]
 
 
 def detect_with_hog(frame_bgr: np.ndarray) -> List[Detection]:
@@ -2429,15 +2805,69 @@ def detect_with_hog(frame_bgr: np.ndarray) -> List[Detection]:
     if hog_detector is None:
         hog_detector = cv2.HOGDescriptor()
         hog_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    rects, weights = hog_detector.detectMultiScale(frame_bgr, winStride=(8, 8), padding=(8, 8), scale=1.05)
+    rects, weights = hog_detector.detectMultiScale(
+        frame_bgr, winStride=(4, 4), padding=(12, 12), scale=1.04
+    )
     h, w = frame_bgr.shape[:2]
     dets = []
     for (x, y, rw, rh), wt in zip(rects, weights):
-        conf = float(wt)
-        if conf < 0.2:
+        conf = float(wt[0] if hasattr(wt, "__len__") else wt)
+        if conf < 0.15:
             continue
         bbox = (int(x), int(y), int(x + rw), int(y + rh))
-        dets.append(Detection("person", min(0.9, 0.4 + conf / 2.0), bbox, approximate_distance_from_bbox(w, bbox), "hog", time.time()))
+        dets.append(
+            Detection(
+                "person",
+                min(0.92, 0.35 + conf / 2.0),
+                bbox,
+                approximate_distance_from_bbox(w, bbox),
+                "hog",
+                time.time(),
+            )
+        )
+    return dets
+
+
+def detect_colored_sign_objects(frame_bgr: np.ndarray) -> List[Detection]:
+    """Detect green/red/blue sign boards as objects when YOLO model is missing."""
+    if cv2 is None:
+        return []
+    h, w = frame_bgr.shape[:2]
+    rois = find_color_sign_rois(frame_bgr)
+    dets: List[Detection] = []
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    for box in rois[:6]:
+        x1, y1, x2, y2 = box
+        if x2 - x1 < 20 or y2 - y1 < 10:
+            continue
+        patch = hsv[y1:y2, x1:x2]
+        if patch.size == 0:
+            continue
+        mean_h = float(np.mean(patch[:, :, 0]))
+        mean_s = float(np.mean(patch[:, :, 1]))
+        aspect = (x2 - x1) / float(max(1, y2 - y1))
+        if 35 <= mean_h <= 95 and mean_s > 40:
+            label = "sign"
+            conf = 0.62 if aspect >= 2.0 else 0.50
+        elif mean_h <= 14 or mean_h >= 160:
+            label = "stop sign" if aspect < 1.8 else "sign"
+            conf = 0.58
+        elif 95 <= mean_h <= 130:
+            label = "sign"
+            conf = 0.52
+        else:
+            label = "sign"
+            conf = 0.45
+        dets.append(
+            Detection(
+                label,
+                conf,
+                box,
+                approximate_distance_from_bbox(w, box),
+                "color_sign",
+                time.time(),
+            )
+        )
     return dets
 
 
@@ -2445,21 +2875,120 @@ def detect_with_contours(frame_bgr: np.ndarray) -> List[Detection]:
     if cv2 is None:
         return []
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blur, 60, 140)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 130)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     h, w = frame_bgr.shape[:2]
+    frame_area = float(max(1, h * w))
     dets = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < 1400:
+        if area < 900 or area > frame_area * 0.55:
             continue
         x, y, rw, rh = cv2.boundingRect(c)
-        if rw < 18 or rh < 18:
+        if rw < 22 or rh < 22:
+            continue
+        # Prefer mid-frame obstacles (not sky strip)
+        if y < int(h * 0.08) and rh < int(h * 0.2):
             continue
         bbox = (x, y, x + rw, y + rh)
-        dets.append(Detection("obstacle", 0.35, bbox, approximate_distance_from_bbox(w, bbox), "contour", time.time()))
-    return dets[:5]
+        conf = min(0.55, 0.28 + area / 25000.0)
+        dets.append(
+            Detection(
+                "obstacle",
+                conf,
+                bbox,
+                approximate_distance_from_bbox(w, bbox),
+                "contour",
+                time.time(),
+            )
+        )
+    dets.sort(key=lambda d: d.confidence, reverse=True)
+    return dets[:6]
+
+
+def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def merge_detections(groups: List[List[Detection]], iou_thresh: float = 0.45) -> List[Detection]:
+    """Merge multi-source detections, keeping highest-confidence overlaps."""
+    merged: List[Detection] = []
+    for group in groups:
+        for det in group:
+            replaced = False
+            for i, existing in enumerate(merged):
+                if _bbox_iou(det.bbox, existing.bbox) >= iou_thresh:
+                    if det.confidence >= existing.confidence:
+                        merged[i] = det
+                    replaced = True
+                    break
+            if not replaced:
+                merged.append(det)
+    merged.sort(key=lambda d: d.confidence, reverse=True)
+    return merged[:12]
+
+
+def run_camera_detections(frame_bgr: np.ndarray, frame_n: int) -> List[Detection]:
+    """AI detection — YOLO ONNX on full frame; HOG/signs fill gaps."""
+    global latest_detection_source, _last_ai_fps_count
+    if cv2 is None:
+        return []
+    h, w = frame_bgr.shape[:2]
+    small = cv2.resize(
+        frame_bgr, (AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT), interpolation=cv2.INTER_LINEAR
+    )
+    hailo_out = run_hailo_yolo_detector(small)
+    if hailo_out:
+        latest_detection_source = "hailo"
+        _last_ai_fps_count += 1
+        return scale_detections_to_frame(hailo_out, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
+
+    # Full-resolution YOLO for accuracy (model expects 640 blob inside)
+    dnn: List[Detection] = []
+    if os.path.isfile(AI_DNN_MODEL_PATH) and frame_n % max(1, DNN_EVERY_N_FRAMES) == 0:
+        dnn = detect_with_opencv_dnn(frame_bgr)
+
+    hog = detect_with_hog(small)
+    signs = detect_colored_sign_objects(frame_bgr)
+
+    groups = [
+        dnn,
+        scale_detections_to_frame(hog, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h) if hog else [],
+        signs,
+    ]
+    # Contours only when YOLO has nothing useful (avoid noisy boxes)
+    if not dnn:
+        contours = detect_with_contours(small)
+        if contours:
+            groups.append(
+                scale_detections_to_frame(contours, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
+            )
+
+    dets = merge_detections(groups)
+    if dnn:
+        latest_detection_source = "opencv_dnn"
+    elif hog and signs:
+        latest_detection_source = "hog+sign"
+    elif hog:
+        latest_detection_source = "hog"
+    elif signs:
+        latest_detection_source = "color_sign"
+    else:
+        latest_detection_source = "none"
+    if dets:
+        _last_ai_fps_count += 1
+    return dets
 
 
 def simulated_camera_frame_and_detections() -> Tuple[np.ndarray, List[Detection], List[OCRResult]]:
@@ -2525,40 +3054,6 @@ def scale_detections_to_frame(
             )
         )
     return out
-
-
-def run_camera_detections(frame_bgr: np.ndarray, frame_n: int) -> List[Detection]:
-    """AI detection on downscaled frame — Hailo first, then OpenCV fallback."""
-    global latest_detection_source, _last_ai_fps_count
-    if cv2 is None:
-        return []
-    h, w = frame_bgr.shape[:2]
-    small = cv2.resize(
-        frame_bgr, (AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT), interpolation=cv2.INTER_LINEAR
-    )
-    hailo_out = run_hailo_yolo_detector(small)
-    if hailo_out:
-        latest_detection_source = "hailo"
-        _last_ai_fps_count += 1
-        return scale_detections_to_frame(hailo_out, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
-    if frame_n % max(1, DNN_EVERY_N_FRAMES) == 0:
-        dets = detect_with_opencv_dnn(small)
-        if dets:
-            latest_detection_source = "opencv_dnn"
-            _last_ai_fps_count += 1
-            return scale_detections_to_frame(dets, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
-    dets = detect_with_hog(small)
-    if dets:
-        latest_detection_source = "hog"
-        _last_ai_fps_count += 1
-        return scale_detections_to_frame(dets, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
-    if frame_n % 12 == 0:
-        dets = detect_with_contours(small)
-        if dets:
-            latest_detection_source = "contour"
-            _last_ai_fps_count += 1
-            return scale_detections_to_frame(dets, AI_PROCESS_WIDTH, AI_PROCESS_HEIGHT, w, h)
-    return []
 
 
 def _valid_frame(frame: Optional[np.ndarray]) -> bool:
@@ -2860,7 +3355,7 @@ def draw_camera_overlays(frame_bgr: np.ndarray, dets: List[Detection], ocr_items
         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2, cv2.LINE_AA,
     )
     cv2.putText(
-        out, "Hold sign in yellow box — press R to read now",
+        out, "Hold street/sign text in yellow box — R=read now",
         (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA,
     )
 
@@ -3745,6 +4240,7 @@ def handle_keydown(key: int, screen: pygame.Surface) -> Optional[pygame.Surface]
 
 def main() -> None:
     global ai_labels
+    resolve_ai_model_paths()
     ai_labels = load_labels(AI_LABELS_PATH)
     print_voice_settings()
     print_camera_settings()
