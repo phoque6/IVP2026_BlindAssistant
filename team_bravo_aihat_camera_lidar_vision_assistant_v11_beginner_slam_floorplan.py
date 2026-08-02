@@ -1239,7 +1239,7 @@ def test_voice_obstacle() -> None:
 
 def test_voice_stop() -> None:
     stop_current_voice()
-    run_tts("Stop. Obstacle very close ahead", force=True)
+    run_tts("Stop. Behind you", force=True)
 
 
 def toggle_voice_enabled() -> None:
@@ -1439,7 +1439,11 @@ def update_object_voice_state_machine(detections: List[Detection], frame_w: int)
 
 
 def update_lidar_voice_state_machine(raw_alert: str) -> None:
-    """Confirm obstacles after several scans; only clear after sustained CLEAR."""
+    """Confirm obstacles after several scans; only clear after sustained CLEAR.
+
+    Hold VERY_CLOSE_* once confirmed — do not flicker down to STRONG/normal
+    in the same direction (that was cutting off 'Stop. Behind you' mid-speech).
+    """
     global raw_lidar_alert, lidar_candidate_alert, lidar_candidate_count
     global confirmed_lidar_alert, lidar_clear_streak
     raw_lidar_alert = raw_alert
@@ -1462,9 +1466,17 @@ def update_lidar_voice_state_machine(raw_alert: str) -> None:
         lidar_candidate_count = 1
 
     if lidar_candidate_count >= LIDAR_CONFIRM_SCANS:
-        if confirmed_lidar_alert != lidar_candidate_alert:
-            print(f"LiDAR obstacle confirmed: {lidar_candidate_alert}")
-        confirmed_lidar_alert = lidar_candidate_alert
+        new_alert = lidar_candidate_alert
+        # Keep very-close until CLEAR or a different direction — avoids restart TTS
+        if confirmed_lidar_alert.startswith("VERY_CLOSE_"):
+            same_dir = lidar_alert_direction(confirmed_lidar_alert) == lidar_alert_direction(
+                new_alert
+            )
+            if same_dir and not new_alert.startswith("VERY_CLOSE_"):
+                return
+        if confirmed_lidar_alert != new_alert:
+            print(f"LiDAR obstacle confirmed: {new_alert}")
+        confirmed_lidar_alert = new_alert
 
 
 def confirm_sign_text(text: str, speak_now: bool = True) -> None:
@@ -1523,7 +1535,7 @@ def matching_camera_object(
 
 
 def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> str:
-    """LiDAR obstacle alerts — distance safety first (v8-style short phrases)."""
+    """LiDAR obstacle alerts — short phrases that finish before the next scan."""
     obj = normalize_object_label(object_label) if object_label else None
     if obj in (None, "Object", "Obstacle", "Sign"):
         obj = None
@@ -1533,24 +1545,27 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
         return "Obstacles on both sides"
 
     if lidar_alert.startswith("VERY_CLOSE_"):
+        # Keep behind-you short so the full stop warning is always heard
+        if direction == "behind":
+            return "Stop. Behind you"
         if obj:
             if direction == "ahead":
-                return f"Stop. {obj} very close ahead"
-            return f"Stop. {obj} very close on your {direction}"
+                return f"Stop. {obj} ahead"
+            return f"Stop. {obj} on your {direction}"
         if direction == "ahead":
-            return "Stop. Obstacle very close ahead"
-        if direction == "behind":
-            return "Stop. Obstacle very close behind you"
-        return f"Stop. Obstacle very close on your {direction}"
+            return "Stop. Ahead"
+        return f"Stop. On your {direction}"
 
     if lidar_alert.startswith("STRONG_"):
+        if direction == "behind":
+            return "Careful. Behind you"
         if obj:
             if direction == "ahead":
                 return f"Careful. {obj} ahead"
             return f"Careful. {obj} on your {direction}"
         if direction == "ahead":
-            return "Careful. Obstacle ahead"
-        return f"Careful. Obstacle on your {direction}"
+            return "Careful. Ahead"
+        return f"Careful. On your {direction}"
 
     if obj:
         if direction == "ahead":
@@ -1559,7 +1574,7 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
             return f"Obstacle behind you. {obj}"
         return f"Obstacle on your {direction}. {obj}"
 
-    if lidar_alert == "BACK":
+    if lidar_alert == "BACK" or direction == "behind":
         return "Obstacle behind you"
     if direction == "ahead":
         return "Obstacle ahead"
@@ -1612,14 +1627,18 @@ def choose_voice_message(
 ) -> Optional[Tuple[str, str, str, bool]]:
     """
     Priority:
-      1) Sign OCR (fast interrupt)
+      1) Sign OCR
       2) LiDAR obstacle distance (safety)
       3) Camera objects only when path is clear (what user cannot see)
       4) Path clear
+
+    While TTS is playing, return None so phrases finish completely.
     """
     now = time.time()
+    if is_voice_speaking():
+        return None
 
-    # 1) Signs — interrupt everything when due
+    # 1) Signs — after current speech finishes
     if confirmed_sign_text:
         if (
             confirmed_sign_text != last_spoken_sign_text
@@ -1693,9 +1712,11 @@ def speak_chosen_message(
 
     if not is_voice_output_allowed():
         return False
-    if interrupt or category in ("sign", "lidar_very_close", "lidar_strong"):
-        if is_voice_speaking():
-            stop_current_voice()
+    # Never kill speech mid-sentence (was cutting off "Stop. Behind you").
+    # Wait until the current phrase finishes, then speak the next alert.
+    if is_voice_speaking():
+        return False
+    _ = interrupt  # kept for call-site compatibility; no mid-phrase interrupt
     ok = run_tts(spoken_text)
     if not ok:
         return False
