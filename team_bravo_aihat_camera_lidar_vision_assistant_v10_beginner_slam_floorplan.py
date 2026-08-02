@@ -210,12 +210,12 @@ VERY_CLOSE_DISTANCE_M = 0.40
 SIGN_CONFIRM_DETECTIONS = 1
 SIGN_REPEAT_SECONDS = 5.0
 
-# Camera object voice — only speak when object is confidently identified
-CAMERA_OBJECT_CONFIRM_DETECTIONS = 5
-CAMERA_OBJECT_REPEAT_SECONDS = 12.0
-CAMERA_OBJECT_MAX_ANNOUNCE = 1
-CAMERA_OBJECT_VOICE_MIN_CONFIDENCE = 0.55
-CAMERA_OBJECT_ALLOWED_SOURCES = ("opencv_dnn", "hailo", "hog")
+# Camera object voice — speak named YOLO/HOG objects when reasonably sure
+CAMERA_OBJECT_CONFIRM_DETECTIONS = 3
+CAMERA_OBJECT_REPEAT_SECONDS = 10.0
+CAMERA_OBJECT_MAX_ANNOUNCE = 2
+CAMERA_OBJECT_VOICE_MIN_CONFIDENCE = 0.40
+CAMERA_OBJECT_ALLOWED_SOURCES = ("opencv_dnn", "hailo", "hog", "color_sign")
 
 # LiDAR obstacle voice — confirm faster; do not clear on one CLEAR frame
 LIDAR_CONFIRM_SCANS = 4
@@ -247,13 +247,12 @@ SLAM_ACCEPT_MEAN_ERR_M = 0.35
 CLEAR_CONFIRM_SCANS = 6
 CLEAR_REPEAT_SECONDS = 20.0
 
-ESPEAK_SPEED = 95
-ESPEAK_AMPLITUDE = 200
-ESPEAK_WORD_GAP_MS = 45
-ESPEAK_PITCH = 40
+ESPEAK_SPEED = 150
+ESPEAK_AMPLITUDE = 190
+ESPEAK_WORD_GAP_MS = 8
+ESPEAK_PITCH = 45
 ESPEAK_VOICE = "en"
-VOICE_WORD_PAUSE_SECONDS = 0.22  # extra pause after each spoken word
-WINDOWS_TTS_RATE = -4
+WINDOWS_TTS_RATE = 0
 
 USEFUL_OBJECT_LABELS = (
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "bench",
@@ -1081,27 +1080,19 @@ def _run_tts_windows(text: str) -> bool:
         with _tts_lock:
             _tts_busy = True
         try:
-            words = [w for w in re.split(r"\s+", text.strip()) if w]
-            if not words:
-                return
-            # Speak one word at a time so each word is clear before the next
-            parts = []
-            for w in words:
-                safe = w.replace("'", "''")
-                parts.append(f"$s.Speak('{safe}'); Start-Sleep -Milliseconds {int(VOICE_WORD_PAUSE_SECONDS * 1000)}")
+            safe = text.replace("'", "''")
             ps = (
                 "Add-Type -AssemblyName System.Speech; "
                 "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
                 f"$s.Rate = {WINDOWS_TTS_RATE}; "
                 "$s.Volume = 100; "
-                + " ".join(parts)
+                f"$s.Speak('{safe}')"
             )
-            timeout_s = max(25, 3 + len(words) * 2)
             subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=timeout_s,
+                timeout=20,
                 check=False,
             )
         except Exception as exc:
@@ -1115,20 +1106,27 @@ def _run_tts_windows(text: str) -> bool:
 
 
 def clarify_speech_text(text: str) -> str:
-    """Normalize speech text; keep wording simple for clear word-by-word reading."""
-    t = " ".join(text.replace(",", " ").replace(".", " ").split())
+    """Light cleanup only — keep natural full-sentence speech."""
+    t = " ".join(text.split())
     t = re.sub(r"\bAve\b", "Avenue", t, flags=re.IGNORECASE)
     t = re.sub(r"\bSt\b", "Street", t, flags=re.IGNORECASE)
     t = re.sub(r"\bRd\b", "Road", t, flags=re.IGNORECASE)
     return t
 
 
-def _speak_words_espeak(words: List[str]) -> bool:
-    """Speak each word fully before starting the next (clearest assistive mode)."""
+def run_tts(text: str, force: bool = False) -> bool:
+    """Speak a full sentence at normal speed (not word-by-word)."""
     global current_voice_process
-    if not tts_executable or not words:
+    if not force and not is_voice_output_allowed():
         return False
-    for word in words:
+    if not tts_checked:
+        init_voice_system()
+
+    spoken = clarify_speech_text(text)
+    if not spoken:
+        return False
+
+    if tts_backend == "espeak" and tts_executable:
         args = [
             tts_executable,
             "-v", ESPEAK_VOICE,
@@ -1136,54 +1134,21 @@ def _speak_words_espeak(words: List[str]) -> bool:
             "-a", str(ESPEAK_AMPLITUDE),
             "-g", str(ESPEAK_WORD_GAP_MS),
             "-p", str(ESPEAK_PITCH),
-            word,
+            spoken,
         ]
         try:
             current_voice_process = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            current_voice_process.wait(timeout=8)
+            return True
         except Exception:
             print("\a", end="", flush=True)
             return False
-        finally:
-            current_voice_process = None
-        time.sleep(VOICE_WORD_PAUSE_SECONDS)
-    return True
-
-
-def run_tts(text: str, force: bool = False) -> bool:
-    """Speak text one word at a time. force=True bypasses mute/off (for tests)."""
-    global current_voice_process, _tts_busy
-    if not force and not is_voice_output_allowed():
-        return False
-    if not tts_checked:
-        init_voice_system()
-
-    spoken = clarify_speech_text(text)
-    words = [w for w in spoken.split() if w]
-    if not words:
-        return False
-
-    if tts_backend == "espeak" and tts_executable:
-        # Run word-by-word in a worker so UI stays responsive
-        def _worker() -> None:
-            global _tts_busy
-            with _tts_lock:
-                _tts_busy = True
-            try:
-                _speak_words_espeak(words)
-            finally:
-                with _tts_lock:
-                    _tts_busy = False
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return True
 
     if tts_backend == "windows":
         return _run_tts_windows(spoken)
 
-    print(f"[VOICE] {' | '.join(words)}")
+    print(f"[VOICE] {spoken}")
     print("\a", end="", flush=True)
     return True
 
@@ -1277,7 +1242,7 @@ def print_voice_settings() -> None:
     print(f"- Object confirm: {CAMERA_OBJECT_CONFIRM_DETECTIONS}")
     print(f"- Object min confidence: {CAMERA_OBJECT_VOICE_MIN_CONFIDENCE:.2f}")
     print(f"- Object repeat: {CAMERA_OBJECT_REPEAT_SECONDS:.0f} seconds")
-    print(f"- Voice: word-by-word pause {VOICE_WORD_PAUSE_SECONDS:.2f}s speed={ESPEAK_SPEED}")
+    print(f"- Voice speed: {ESPEAK_SPEED} (normal continuous speech)")
     print(f"- Temporary mute: {VOICE_TEMP_MUTE_SECONDS:.0f} seconds (button Mute / N)")
     print(f"- Alert distance: {ALERT_DISTANCE_M:.1f} m")
     print(f"- Strong warning distance: {STRONG_WARNING_DISTANCE_M:.2f} m")
@@ -1360,33 +1325,33 @@ def pick_best_camera_object(
 def pick_surrounding_objects(
     detections: List[Detection], frame_w: int, max_n: int = CAMERA_OBJECT_MAX_ANNOUNCE
 ) -> List[Tuple[str, str]]:
-    """Pick only confidently identified useful objects for voice announcement."""
+    """Pick named objects (person/chair/car/…) for voice — skip vague contour blobs."""
     if not detections:
         return []
     scored: List[Tuple[float, str, str]] = []
     for det in detections:
-        # Certainty gate: high confidence + trusted detector source
         if det.confidence < CAMERA_OBJECT_VOICE_MIN_CONFIDENCE:
             continue
         if det.source not in CAMERA_OBJECT_ALLOWED_SOURCES:
             continue
-        low = det.label.lower()
-        if not any(p in low for p in USEFUL_OBJECT_LABELS):
+        low = det.label.lower().strip()
+        # Contour "obstacle" is not a real identified object name
+        if low in ("obstacle", "object") and det.source == "contour":
             continue
-        # Contour-style generic "obstacle" is never certain enough to speak
-        if low.strip() in ("obstacle", "object"):
+        if not any(p in low for p in USEFUL_OBJECT_LABELS):
             continue
         direction = bbox_direction(det.bbox, frame_w)
         x1, y1, x2, y2 = det.bbox
         area = max(1, (x2 - x1) * (y2 - y1))
-        # Reject tiny uncertain boxes
-        if area < 1800:
+        if area < 1200:
             continue
         cx = (x1 + x2) / 2.0
         centre_bonus = 1.0 - abs(cx - frame_w / 2.0) / max(1.0, frame_w / 2.0)
-        score = det.confidence * 3.0 + min(1.2, area / 50000.0) + 0.35 * centre_bonus
+        score = det.confidence * 2.5 + min(1.4, area / 40000.0) + 0.4 * centre_bonus
+        if det.source == "opencv_dnn":
+            score += 1.0
         if "person" in low:
-            score += 0.6
+            score += 0.7
         scored.append((score, det.label, direction))
     scored.sort(key=lambda t: t[0], reverse=True)
 
@@ -1401,8 +1366,28 @@ def pick_surrounding_objects(
         used_dirs.add(direction)
         used_labels.add(nice)
         if len(chosen) >= max_n:
-            return chosen
+            break
     return chosen
+
+
+def build_object_speech(label: str, direction: str) -> str:
+    obj = normalize_object_label(label)
+    if direction == "LEFT":
+        return f"{obj} on your left"
+    if direction == "RIGHT":
+        return f"{obj} on your right"
+    return f"{obj} ahead"
+
+
+def build_surroundings_speech(items: List[Tuple[str, str]]) -> str:
+    if not items:
+        return ""
+    parts = [build_object_speech(label, direction) for label, direction in items]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
 
 
 def update_sign_voice_state_machine(ocr_raw_text: str) -> None:
@@ -1518,22 +1503,6 @@ def matching_camera_object(
     if want_dir == "FRONT" and direction == "FRONT":
         return label
     return None
-
-
-def build_object_speech(label: str, direction: str) -> str:
-    obj = normalize_object_label(label)
-    if direction == "LEFT":
-        return f"{obj} on your left"
-    if direction == "RIGHT":
-        return f"{obj} on your right"
-    return f"{obj} ahead"
-
-
-def build_surroundings_speech(items: List[Tuple[str, str]]) -> str:
-    """One confident object at a time for clearer speech."""
-    if not items:
-        return ""
-    return build_object_speech(items[0][0], items[0][1])
 
 
 def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> str:
