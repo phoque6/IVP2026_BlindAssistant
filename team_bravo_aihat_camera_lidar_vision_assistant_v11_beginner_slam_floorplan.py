@@ -3,8 +3,8 @@
 Team Bravo Vision Assistant v11 — beginner LiDAR SLAM floor-plan map
 ==================================================================================
 
-v11: Same as v10 + clearer YOLO ONNX object detection, street-sign OCR, normal
-     continuous voice, confident object announcements, Mute 30s / N.
+v11: LiDAR = obstacle distance (fast v8-style). Camera = named objects the user
+     cannot see. Signs read quickly. Beginner SLAM floor plan kept.
 
 Hardware:
   - Raspberry Pi 5
@@ -142,10 +142,11 @@ COCO_DEFAULT_LABELS = [
 ]
 
 # Time-based camera processing (decoupled from capture rate)
-OCR_INTERVAL_SECONDS = 1.6
-OCR_VOICE_REPEAT_SECONDS = 6.0
-OCR_PERSIST_SECONDS = 14.0
-OCR_FRAME_SCALE = 3.2
+# Signs: fast like v8 — short interval, speak quickly
+OCR_INTERVAL_SECONDS = 1.0
+OCR_VOICE_REPEAT_SECONDS = 4.0
+OCR_PERSIST_SECONDS = 10.0
+OCR_FRAME_SCALE = 2.8
 AI_DETECTION_INTERVAL_SECONDS = 0.40
 CAMERA_SLEEP_SECONDS = 0.001
 
@@ -226,21 +227,21 @@ ALERT_DISTANCE_M = 1.0
 STRONG_WARNING_DISTANCE_M = 0.75
 VERY_CLOSE_DISTANCE_M = 0.40
 
-# Sign / OCR voice — speak after 1 stable read for classroom reliability
+# Sign / OCR voice — speak on first good read (v8-style speed)
 SIGN_CONFIRM_DETECTIONS = 1
-SIGN_REPEAT_SECONDS = 5.0
+SIGN_REPEAT_SECONDS = 4.0
 
-# Camera object voice — speak named YOLO/HOG objects when reasonably sure
-CAMERA_OBJECT_CONFIRM_DETECTIONS = 2
-CAMERA_OBJECT_REPEAT_SECONDS = 10.0
+# Camera object voice — informational only (what LiDAR cannot name), not obstacle alerts
+CAMERA_OBJECT_CONFIRM_DETECTIONS = 3
+CAMERA_OBJECT_REPEAT_SECONDS = 8.0
 CAMERA_OBJECT_MAX_ANNOUNCE = 2
-CAMERA_OBJECT_VOICE_MIN_CONFIDENCE = 0.30
-CAMERA_OBJECT_ALLOWED_SOURCES = ("opencv_dnn", "hailo", "hog", "color_sign")
+CAMERA_OBJECT_VOICE_MIN_CONFIDENCE = 0.35
+CAMERA_OBJECT_ALLOWED_SOURCES = ("opencv_dnn", "hailo", "hog")
 
-# LiDAR obstacle voice — confirm faster; do not clear on one CLEAR frame
-LIDAR_CONFIRM_SCANS = 4
-OBSTACLE_REPEAT_SECONDS = 10.0
-VERY_CLOSE_REPEAT_SECONDS = 10.0
+# LiDAR = obstacle distance safety (v8-style fast feedback)
+LIDAR_CONFIRM_SCANS = 2
+OBSTACLE_REPEAT_SECONDS = 7.0
+VERY_CLOSE_REPEAT_SECONDS = 5.0
 
 # Temporary mute (button / N key) — auto-unmute after this many seconds
 VOICE_TEMP_MUTE_SECONDS = 30.0
@@ -264,13 +265,13 @@ SLAM_POSE_HISTORY = 400
 SLAM_ACCEPT_MEAN_ERR_M = 0.35
 
 # Path clear voice — require sustained clear before resetting obstacle alert
-CLEAR_CONFIRM_SCANS = 6
-CLEAR_REPEAT_SECONDS = 20.0
+CLEAR_CONFIRM_SCANS = 4
+CLEAR_REPEAT_SECONDS = 12.0
 
-ESPEAK_SPEED = 150
-ESPEAK_AMPLITUDE = 190
-ESPEAK_WORD_GAP_MS = 8
-ESPEAK_PITCH = 45
+ESPEAK_SPEED = 155
+ESPEAK_AMPLITUDE = 180
+ESPEAK_WORD_GAP_MS = 6
+ESPEAK_PITCH = 50
 ESPEAK_VOICE = "en"
 WINDOWS_TTS_RATE = 0
 
@@ -1391,26 +1392,6 @@ def pick_surrounding_objects(
     return chosen
 
 
-def build_object_speech(label: str, direction: str) -> str:
-    obj = normalize_object_label(label)
-    if direction == "LEFT":
-        return f"{obj} on your left"
-    if direction == "RIGHT":
-        return f"{obj} on your right"
-    return f"{obj} ahead"
-
-
-def build_surroundings_speech(items: List[Tuple[str, str]]) -> str:
-    if not items:
-        return ""
-    parts = [build_object_speech(label, direction) for label, direction in items]
-    if len(parts) == 1:
-        return parts[0]
-    if len(parts) == 2:
-        return f"{parts[0]} and {parts[1]}"
-    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
-
-
 def update_sign_voice_state_machine(ocr_raw_text: str) -> None:
     global sign_candidate_text, sign_candidate_count, confirmed_sign_text, last_ocr_text
     cleaned = match_known_sign_text(ocr_raw_text) or clean_ocr_text(ocr_raw_text)
@@ -1508,6 +1489,7 @@ def confirm_sign_text(text: str, speak_now: bool = True) -> None:
 def matching_camera_object(
     lidar_alert: str, detections: List[Detection], frame_w: int
 ) -> Optional[str]:
+    """Optional name enrichment for a LiDAR obstacle (YOLO only — not for detecting obstacles)."""
     if not fusion_enabled or not detections:
         return None
     if "LEFT" in lidar_alert:
@@ -1516,25 +1498,42 @@ def matching_camera_object(
         want_dir = "RIGHT"
     else:
         want_dir = "FRONT"
-    label, direction = pick_best_camera_object(detections, frame_w)
-    if not label:
-        return None
-    if direction == want_dir:
-        return label
-    if want_dir == "FRONT" and direction == "FRONT":
-        return label
-    return None
+    best_label = ""
+    best_conf = 0.0
+    for det in detections:
+        if det.source not in ("opencv_dnn", "hailo"):
+            continue
+        if det.confidence < 0.40:
+            continue
+        low = det.label.lower()
+        if not any(p in low for p in USEFUL_OBJECT_LABELS):
+            continue
+        if low in ("obstacle", "object", "sign"):
+            continue
+        direction = bbox_direction(det.bbox, frame_w)
+        if want_dir == "FRONT":
+            if direction != "FRONT":
+                continue
+        elif direction != want_dir:
+            continue
+        if det.confidence > best_conf:
+            best_conf = det.confidence
+            best_label = det.label
+    return best_label or None
 
 
 def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> str:
+    """LiDAR obstacle alerts — distance safety first (v8-style short phrases)."""
     obj = normalize_object_label(object_label) if object_label else None
+    if obj in (None, "Object", "Obstacle", "Sign"):
+        obj = None
     direction = lidar_alert_direction(lidar_alert)
 
     if lidar_alert == "BOTH_SIDES":
         return "Obstacles on both sides"
 
     if lidar_alert.startswith("VERY_CLOSE_"):
-        if obj and obj != "Object":
+        if obj:
             if direction == "ahead":
                 return f"Stop. {obj} very close ahead"
             return f"Stop. {obj} very close on your {direction}"
@@ -1545,7 +1544,7 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
         return f"Stop. Obstacle very close on your {direction}"
 
     if lidar_alert.startswith("STRONG_"):
-        if obj and obj != "Object":
+        if obj:
             if direction == "ahead":
                 return f"Careful. {obj} ahead"
             return f"Careful. {obj} on your {direction}"
@@ -1553,12 +1552,12 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
             return "Careful. Obstacle ahead"
         return f"Careful. Obstacle on your {direction}"
 
-    if obj and obj != "Object":
+    if obj:
         if direction == "ahead":
-            return f"{obj} ahead"
+            return f"Obstacle ahead. {obj}"
         if direction == "behind":
-            return f"{obj} behind you"
-        return f"{obj} on your {direction}"
+            return f"Obstacle behind you. {obj}"
+        return f"Obstacle on your {direction}. {obj}"
 
     if lidar_alert == "BACK":
         return "Obstacle behind you"
@@ -1568,13 +1567,10 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
 
 
 def build_sign_speech(text: str) -> str:
+    """Fast, clear sign reading (v8-style continuous phrase)."""
     compact = text.replace(" ", "")
     if compact.isdigit():
-        return "Number " + " ".join(list(compact))
-    alpha = sum(1 for c in compact if c.isalpha())
-    digit = sum(1 for c in compact if c.isdigit())
-    if digit >= 1 and alpha <= 2:
-        return "Number " + " ".join(list(compact))
+        return f"Sign says {text}"
     words = text.title().split()
     expanded = []
     for w in words:
@@ -1590,16 +1586,40 @@ def build_sign_speech(text: str) -> str:
     return "Sign says " + " ".join(expanded)
 
 
+def build_object_speech(label: str, direction: str) -> str:
+    """Camera scene description — not an obstacle warning."""
+    obj = normalize_object_label(label)
+    if direction == "LEFT":
+        return f"There is a {obj} on your left"
+    if direction == "RIGHT":
+        return f"There is a {obj} on your right"
+    return f"There is a {obj} ahead"
+
+
+def build_surroundings_speech(items: List[Tuple[str, str]]) -> str:
+    if not items:
+        return ""
+    parts = [build_object_speech(label, direction) for label, direction in items]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+
 def choose_voice_message(
     detections: List[Detection], frame_w: int
 ) -> Optional[Tuple[str, str, str, bool]]:
     """
-    Return one voice message: (spoken_text, category_key, voice_track_key, interrupt).
-    Priority: OCR sign > VERY_CLOSE > STRONG > lidar normal > camera objects > path clear.
+    Priority:
+      1) Sign OCR (fast interrupt)
+      2) LiDAR obstacle distance (safety)
+      3) Camera objects only when path is clear (what user cannot see)
+      4) Path clear
     """
     now = time.time()
 
-    # Sign text has priority over all obstacle warnings when due to speak
+    # 1) Signs — interrupt everything when due
     if confirmed_sign_text:
         if (
             confirmed_sign_text != last_spoken_sign_text
@@ -1608,6 +1628,7 @@ def choose_voice_message(
             msg = build_sign_speech(confirmed_sign_text)
             return msg, "sign", confirmed_sign_text, True
 
+    # 2) LiDAR obstacles — distance only (camera may name the obstacle)
     if confirmed_lidar_alert.startswith("VERY_CLOSE_"):
         if (
             confirmed_lidar_alert != last_spoken_lidar_alert
@@ -1624,7 +1645,7 @@ def choose_voice_message(
         ):
             obj = matching_camera_object(confirmed_lidar_alert, detections, frame_w)
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
-            return msg, "lidar_strong", confirmed_lidar_alert, False
+            return msg, "lidar_strong", confirmed_lidar_alert, True
 
     if (
         confirmed_lidar_alert not in ("CLEAR",)
@@ -1638,7 +1659,8 @@ def choose_voice_message(
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
             return msg, "lidar_normal", confirmed_lidar_alert, False
 
-    if confirmed_surroundings and not confirmed_lidar_alert.startswith(("VERY_CLOSE_", "STRONG_")):
+    # 3) Camera objects — only when LiDAR path is clear (informational)
+    if confirmed_surroundings and confirmed_lidar_alert == "CLEAR":
         alert_key = ";".join(
             f"{normalize_object_label(l)}:{d}" for l, d in confirmed_surroundings
         )
@@ -1649,6 +1671,7 @@ def choose_voice_message(
             msg = build_surroundings_speech(confirmed_surroundings)
             return msg, "camera_object", alert_key, False
 
+    # 4) Path clear after danger
     if (
         last_spoken_was_danger
         and confirmed_lidar_alert == "CLEAR"
@@ -1670,7 +1693,7 @@ def speak_chosen_message(
 
     if not is_voice_output_allowed():
         return False
-    if interrupt or category in ("sign", "lidar_very_close"):
+    if interrupt or category in ("sign", "lidar_very_close", "lidar_strong"):
         if is_voice_speaking():
             stop_current_voice()
     ok = run_tts(spoken_text)
@@ -4337,7 +4360,7 @@ def main() -> None:
     pygame.init()
     pygame.display.set_caption("Team Bravo Vision Assistant v11 beginner SLAM floor plan")
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
-    print("Pi 5 v11: beginner SLAM | YOLO ONNX objects | street OCR | obstacle voice 10s | Mute 30s / N")
+    print("Pi 5 v11: LiDAR obstacles (fast) | camera names objects | fast sign OCR | Mute 30s / N")
 
     if voice_enabled:
         pygame.time.wait(300)
