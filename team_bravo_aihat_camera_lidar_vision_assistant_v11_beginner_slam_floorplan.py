@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Team Bravo Vision Assistant v11 — beginner LiDAR SLAM floor-plan map
+Team Bravo Vision Assistant v11 — numbers + road signs + YOLO objects ≤5 m
 ==================================================================================
 
-v11: LiDAR = obstacle distance (fast v8-style). Camera = named objects the user
-     cannot see. Signs read quickly. Beginner SLAM floor plan kept.
+v11 redo (camera-focused, building on v7/v8-style stable OCR + LiDAR safety):
+  - OCR reads NUMBERS (room/door/avenue digits) as well as words
+  - OCR reads LONGER road / street signs (e.g. Ang Mo Kio Ave 5)
+  - YOLO names objects and VOICES them when estimated distance ≤ 5 metres
+  - LiDAR remains primary obstacle distance safety (v8-style)
+  - Beginner SLAM floor-plan map kept
 
 Hardware:
   - Raspberry Pi 5
@@ -157,14 +161,19 @@ OCR_WHOLE_FRAME_FALLBACK = False
 # Vocabulary corrects common signs (EX1T->EXIT) but does NOT block unknown text
 OCR_USE_SIGN_VOCABULARY = False
 OCR_VOCABULARY_CORRECTION = True
-OCR_MIN_CONFIDENCE_SCORE = 0.16
-OCR_REQUIRE_STABLE_READS = 1
+# Slightly stricter than earlier v11 (less spam), still faster than pure v7 for streets/numbers
+OCR_MIN_CONFIDENCE_SCORE = 0.20
+OCR_REQUIRE_STABLE_READS = 2
 OCR_MANUAL_CONFIRM_SCORE = 0.18
-OCR_AUTO_SINGLE_READ_SCORE = 0.30
+OCR_AUTO_SINGLE_READ_SCORE = 0.48
+OCR_NUMBER_AUTO_SCORE = 0.36
+OCR_STREET_AUTO_SCORE = 0.42
 OCR_STABLE_WINDOW_SECONDS = 12.0
-OCR_FUZZY_MATCH_THRESHOLD = 0.70
-OCR_VOCAB_MAX_WORDS = 3
-OCR_VOCAB_MAX_CHARS = 18
+OCR_FUZZY_MATCH_THRESHOLD = 0.78
+OCR_VOCAB_MAX_WORDS = 2
+OCR_VOCAB_MAX_CHARS = 14
+OCR_WORD_CONF_MIN = 28
+OCR_DIGIT_WORD_CONF_MIN = 18
 STREET_NAME_HINTS = (
     "ROAD", "STREET", "ST", "AVE", "AVENUE", "LANE", "DRIVE", "DR",
     "BLVD", "BOULEVARD", "WAY", "PLACE", "PL", "COURT", "CT", "CRESCENT",
@@ -198,7 +207,7 @@ KNOWN_STREET_PHRASES = [
 OCR_CENTRE_FIRST_ONLY = False
 OCR_MAX_EXTRA_ROIS = 10
 OCR_EARLY_EXIT_SCORE = 0.70
-OCR_STREET_EARLY_EXIT_SCORE = 0.40
+OCR_STREET_EARLY_EXIT_SCORE = 0.55
 
 KNOWN_SIGN_WORDS = [
     "EXIT",
@@ -231,11 +240,12 @@ VERY_CLOSE_DISTANCE_M = 0.40
 SIGN_CONFIRM_DETECTIONS = 1
 SIGN_REPEAT_SECONDS = 4.0
 
-# Camera object voice — informational only (what LiDAR cannot name), not obstacle alerts
+# Camera YOLO object voice — announce named objects within 5 metres
 CAMERA_OBJECT_CONFIRM_DETECTIONS = 3
 CAMERA_OBJECT_REPEAT_SECONDS = 8.0
 CAMERA_OBJECT_MAX_ANNOUNCE = 2
 CAMERA_OBJECT_VOICE_MIN_CONFIDENCE = 0.35
+CAMERA_OBJECT_MAX_DISTANCE_M = 5.0
 CAMERA_OBJECT_ALLOWED_SOURCES = ("opencv_dnn", "hailo", "hog")
 
 # LiDAR = obstacle distance safety (v8-style fast feedback)
@@ -1263,6 +1273,7 @@ def print_voice_settings() -> None:
     print(f"- Very close repeat: {VERY_CLOSE_REPEAT_SECONDS:.0f} seconds")
     print(f"- Object confirm: {CAMERA_OBJECT_CONFIRM_DETECTIONS}")
     print(f"- Object min confidence: {CAMERA_OBJECT_VOICE_MIN_CONFIDENCE:.2f}")
+    print(f"- Object max distance: {CAMERA_OBJECT_MAX_DISTANCE_M:.1f} m (YOLO voice)")
     print(f"- Object repeat: {CAMERA_OBJECT_REPEAT_SECONDS:.0f} seconds")
     print(f"- Voice speed: {ESPEAK_SPEED} (normal continuous speech)")
     print(f"- Temporary mute: {VOICE_TEMP_MUTE_SECONDS:.0f} seconds (button Mute / N)")
@@ -1347,7 +1358,7 @@ def pick_best_camera_object(
 def pick_surrounding_objects(
     detections: List[Detection], frame_w: int, max_n: int = CAMERA_OBJECT_MAX_ANNOUNCE
 ) -> List[Tuple[str, str]]:
-    """Pick named objects (person/chair/car/…) for voice — skip vague contour blobs."""
+    """Pick YOLO/named objects within CAMERA_OBJECT_MAX_DISTANCE_M for voice."""
     if not detections:
         return []
     scored: List[Tuple[float, str, str]] = []
@@ -1362,6 +1373,12 @@ def pick_surrounding_objects(
             continue
         if not any(p in low for p in USEFUL_OBJECT_LABELS):
             continue
+        # Estimate distance if missing; only announce objects within 5 m
+        dist = det.distance_m
+        if dist is None:
+            dist = approximate_distance_from_bbox(frame_w, det.bbox)
+        if dist > CAMERA_OBJECT_MAX_DISTANCE_M:
+            continue
         direction = bbox_direction(det.bbox, frame_w)
         x1, y1, x2, y2 = det.bbox
         area = max(1, (x2 - x1) * (y2 - y1))
@@ -1369,7 +1386,9 @@ def pick_surrounding_objects(
             continue
         cx = (x1 + x2) / 2.0
         centre_bonus = 1.0 - abs(cx - frame_w / 2.0) / max(1.0, frame_w / 2.0)
-        score = det.confidence * 2.5 + min(1.4, area / 40000.0) + 0.4 * centre_bonus
+        # Prefer nearer objects
+        near_bonus = max(0.0, (CAMERA_OBJECT_MAX_DISTANCE_M - dist) / CAMERA_OBJECT_MAX_DISTANCE_M)
+        score = det.confidence * 2.5 + min(1.4, area / 40000.0) + 0.4 * centre_bonus + 0.8 * near_bonus
         if det.source == "opencv_dnn":
             score += 1.0
         if "person" in low:
@@ -1582,9 +1601,9 @@ def build_lidar_speech(lidar_alert: str, object_label: Optional[str] = None) -> 
 
 
 def build_sign_speech(text: str) -> str:
-    """Fast, clear sign reading (v8-style continuous phrase)."""
+    """Fast, clear sign reading — numbers and long road names included."""
     compact = text.replace(" ", "")
-    if compact.isdigit():
+    if compact.isdigit() or is_number_like_text(text):
         return f"Sign says {text}"
     words = text.title().split()
     expanded = []
@@ -1627,9 +1646,9 @@ def choose_voice_message(
 ) -> Optional[Tuple[str, str, str, bool]]:
     """
     Priority:
-      1) Sign OCR
+      1) Sign OCR (numbers + long road signs)
       2) LiDAR obstacle distance (safety)
-      3) Camera objects only when path is clear (what user cannot see)
+      3) YOLO camera objects within 5 m (after safety alerts)
       4) Path clear
 
     While TTS is playing, return None so phrases finish completely.
@@ -1678,8 +1697,9 @@ def choose_voice_message(
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
             return msg, "lidar_normal", confirmed_lidar_alert, False
 
-    # 3) Camera objects — only when LiDAR path is clear (informational)
-    if confirmed_surroundings and confirmed_lidar_alert == "CLEAR":
+    # 3) YOLO objects within 5 m — help name what the blind user cannot see
+    #    Speak when path is clear, or after non-critical LiDAR alerts settle
+    if confirmed_surroundings and not confirmed_lidar_alert.startswith("VERY_CLOSE_"):
         alert_key = ";".join(
             f"{normalize_object_label(l)}:{d}" for l, d in confirmed_surroundings
         )
@@ -1920,6 +1940,7 @@ def is_number_like_text(text: str) -> bool:
 
 
 def looks_like_street_name(text: str) -> bool:
+    """True for multi-word road / place names — not random two-word OCR noise."""
     words = text.upper().split()
     compact = text.upper().replace(" ", "")
     if len(words) >= 2 and any(w in STREET_NAME_HINTS for w in words):
@@ -1927,10 +1948,8 @@ def looks_like_street_name(text: str) -> bool:
     if any(h in compact for h in STREET_NAME_COMPACT_HINTS) and len(compact) >= 6:
         return True
     # Place-style names: "ANG MO KIO" (3+ letter words)
-    alpha_words = [w for w in words if any(c.isalpha() for c in w)]
+    alpha_words = [w for w in words if sum(1 for c in w if c.isalpha()) >= 2]
     if len(alpha_words) >= 3 and len(compact) >= 8:
-        return True
-    if len(words) >= 2 and len(compact) >= 8:
         return True
     return False
 
@@ -1941,25 +1960,55 @@ def recover_known_street_phrase(text: str) -> str:
         return ""
     t = re.sub(r"[^A-Z0-9 ]+", " ", text.upper())
     t = re.sub(r"\s+", " ", t).strip()
+    t = _split_glued_street_number(t)
     if not t:
         return ""
     compact = t.replace(" ", "")
-    best = ""
-    best_ratio = 0.0
+    ocr_digits = re.findall(r"\d+", t)
+
+    # Exact / substring hits first
     for phrase in KNOWN_STREET_PHRASES:
         pcompact = phrase.replace(" ", "")
         if phrase == t or pcompact == compact:
             return phrase
         if phrase in t or pcompact in compact:
             return phrase
+
+    # Prefer candidates whose trailing avenue/road number matches OCR digits
+    digit_matched: List[Tuple[float, str]] = []
+    letter_only: List[Tuple[float, str]] = []
+    for phrase in KNOWN_STREET_PHRASES:
+        pcompact = phrase.replace(" ", "")
+        pdigits = re.findall(r"\d+", phrase)
         ratio = difflib.SequenceMatcher(None, compact, pcompact).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best = phrase
-    # Accept strong fuzzy matches for street plates
-    if best and best_ratio >= 0.72 and abs(len(compact) - len(best.replace(" ", ""))) <= 6:
-        return best
+        # Letter-part ratio (strip digits) for Ave N disambiguation
+        t_letters = re.sub(r"\d+", "", compact)
+        p_letters = re.sub(r"\d+", "", pcompact)
+        letter_ratio = difflib.SequenceMatcher(None, t_letters, p_letters).ratio() if t_letters and p_letters else ratio
+        if ocr_digits and pdigits and ocr_digits[-1] == pdigits[-1] and letter_ratio >= 0.70:
+            digit_matched.append((letter_ratio, phrase))
+        elif ratio >= 0.78 and abs(len(compact) - len(pcompact)) <= 5:
+            # Reject wrong avenue number when OCR has a clear digit
+            if ocr_digits and pdigits and ocr_digits[-1] != pdigits[-1]:
+                continue
+            letter_only.append((ratio, phrase))
+
+    if digit_matched:
+        digit_matched.sort(key=lambda x: x[0], reverse=True)
+        return digit_matched[0][1]
+    if letter_only:
+        letter_only.sort(key=lambda x: x[0], reverse=True)
+        return letter_only[0][1]
     return ""
+
+
+def _split_glued_street_number(text: str) -> str:
+    """Turn AVE5 / AVENUE10 into AVE 5 / AVENUE 10 so numbers survive as digits."""
+    return re.sub(
+        r"\b(AVENUE|AVE|ROAD|STREET|ST|LANE|DRIVE|DR|JALAN|LORONG|BLVD|BOULEVARD)(\d+)\b",
+        r"\1 \2",
+        text.upper(),
+    )
 
 
 def is_valid_sign_text(text: str) -> bool:
@@ -2036,29 +2085,14 @@ def pick_ocr_final_text(cleaned: str, matched: str) -> str:
 
 
 def _fix_ocr_chars_in_word(word: str) -> str:
-    """Replace common OCR digit mistakes inside letter words; keep real numbers."""
+    """Keep real numbers intact. Only map digit→letter on classic letter-sign OCR errors."""
     if not word:
         return word
     upper = word.upper()
-    digit_n = sum(1 for c in upper if c.isdigit())
-    alpha_n = sum(1 for c in upper if c.isalpha())
-    # Keep number-like tokens intact (12, 3A, B12)
-    if digit_n >= 1 and digit_n >= alpha_n:
+    # Always preserve tokens that are (or contain) real numbers: 12, 5, 3A, AVE5
+    if any(c.isdigit() for c in upper):
         return upper
-    out: List[str] = []
-    for i, c in enumerate(upper):
-        if c == "0":
-            out.append("O")
-        elif c == "1":
-            prev = upper[i - 1] if i > 0 else ""
-            out.append("I" if prev in ("T", "E", "X", "F", "I") else "L")
-        elif c == "5":
-            out.append("S")
-        elif c == "8":
-            out.append("B")
-        else:
-            out.append(c)
-    return "".join(out)
+    return upper
 
 
 def clean_ocr_text(text: str) -> str:
@@ -2071,6 +2105,7 @@ def clean_ocr_text(text: str) -> str:
 
     words = [_fix_ocr_chars_in_word(w) for w in t.split()]
     t = " ".join(words).strip()
+    t = _split_glued_street_number(t)
 
     corrections = {
         "EX1T": "EXIT", "EX1 T": "EXIT", "EX1": "EXIT", "E X I T": "EXIT", "EXlT": "EXIT", "EX T": "EXIT",
@@ -2087,10 +2122,20 @@ def clean_ocr_text(text: str) -> str:
         t = corrections[t]
     else:
         # Per-word exact fixes only — never rewrite a long phrase because one word matches
-        t = " ".join(corrections.get(w, w) for w in t.split())
+        fixed_words = []
+        for w in t.split():
+            if w.isdigit() or is_number_like_text(w):
+                fixed_words.append(w)
+            else:
+                fixed_words.append(corrections.get(w, w))
+        t = " ".join(fixed_words)
 
     compact = t.replace(" ", "")
     if is_number_like_text(t):
+        return t
+    if looks_like_street_name(t) or recover_known_street_phrase(t):
+        if len(compact) > OCR_MAX_TEXT_LENGTH:
+            return ""
         return t
     if len(compact) < OCR_MIN_TEXT_LENGTH:
         return ""
@@ -2108,6 +2153,7 @@ def clean_ocr_text(text: str) -> str:
             and t not in VOWELLESS_OK
             and not any(t == w or t.startswith(w + " ") for w in VOWELLESS_OK)
             and not looks_like_street_name(t)
+            and not is_number_like_text(t)
         ):
             return ""
 
@@ -2115,48 +2161,54 @@ def clean_ocr_text(text: str) -> str:
 
 
 def match_known_sign_text(text: str) -> str:
-    """Fuzzy-match short sign phrases; also pull known signs out of longer OCR noise."""
-    extracted = extract_known_sign_from_text(text)
-    if extracted:
-        return extracted
-
+    """Match numbers, long street names, then short indoor signs (v7-style gate)."""
     cleaned = clean_ocr_text(text)
-    candidates: List[str] = []
-    if cleaned:
-        candidates.append(cleaned)
     rough = re.sub(r"[^A-Z0-9 ]+", " ", text.upper())
     rough = re.sub(r"\s+", " ", rough).strip()
-    if rough and rough not in candidates:
-        candidates.append(rough)
-
-    if not candidates:
-        return ""
+    rough = _split_glued_street_number(rough) if rough else ""
 
     primary = cleaned or rough
-    if not should_apply_vocab_correction(primary):
+    if not primary:
+        return ""
+
+    # Numbers and street plates first — never collapse to EXIT/STOP
+    recovered = recover_known_street_phrase(primary) or recover_known_street_phrase(text)
+    if recovered:
+        return recovered
+    if is_number_like_text(primary) or looks_like_street_name(primary):
         return primary
 
-    for cand in candidates:
-        if is_known_sign_word(cand):
-            return cand
-
-    if OCR_VOCABULARY_CORRECTION:
-        best_word = ""
-        best_ratio = 0.0
-        best_cand = ""
-        for cand in candidates:
-            for known in KNOWN_SIGN_WORDS:
-                ratio = difflib.SequenceMatcher(None, cand, known).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_word = known
-                    best_cand = cand
-        if (
-            best_ratio >= OCR_FUZZY_MATCH_THRESHOLD
-            and best_word
-            and _fuzzy_length_ok(best_cand, best_word)
-        ):
-            return best_word
+    # Short indoor signs: extract known word only when phrase is short/noisy
+    if should_apply_vocab_correction(primary):
+        extracted = extract_known_sign_from_text(primary) or extract_known_sign_from_text(text)
+        if extracted:
+            return extracted
+        if is_known_sign_word(primary):
+            return primary
+        if OCR_VOCABULARY_CORRECTION:
+            best_word = ""
+            best_ratio = 0.0
+            best_cand = ""
+            for cand in (primary, rough):
+                if not cand:
+                    continue
+                for known in KNOWN_SIGN_WORDS:
+                    ratio = difflib.SequenceMatcher(None, cand, known).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_word = known
+                        best_cand = cand
+            if (
+                best_ratio >= OCR_FUZZY_MATCH_THRESHOLD
+                and best_word
+                and _fuzzy_length_ok(best_cand, best_word)
+            ):
+                return best_word
+    else:
+        # Long OCR: only pull a known short sign if the whole string is mostly that sign
+        extracted = extract_known_sign_from_text(primary)
+        if extracted and len(extracted.replace(" ", "")) >= len(primary.replace(" ", "")) - 2:
+            return extracted
 
     return primary
 
@@ -2238,20 +2290,23 @@ def _bbox_overlap_ratio(
 
 
 def _ocr_tesseract_configs(fast: bool = False, street_line: bool = False) -> List[str]:
-    """Sign-friendly Tesseract configs. street_line prioritises single horizontal lines."""
+    """Sign-friendly Tesseract configs. Includes digit-only passes for numbers."""
     whitelist = " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    digits = " -c tessedit_char_whitelist=0123456789"
     if street_line:
         return [
             f"--oem 3 --psm 7{whitelist}",
             f"--oem 3 --psm 6{whitelist}",
             f"--oem 3 --psm 7",
             f"--oem 3 --psm 13{whitelist}",
+            f"--oem 3 --psm 8{digits}",  # avenue / door numbers
         ]
     if fast:
         return [
             f"--oem 3 --psm 7{whitelist}",
             f"--oem 3 --psm 8{whitelist}",
             f"--oem 3 --psm 6{whitelist}",
+            f"--oem 3 --psm 8{digits}",
             "--oem 3 --psm 6",
         ]
     return [
@@ -2259,6 +2314,8 @@ def _ocr_tesseract_configs(fast: bool = False, street_line: bool = False) -> Lis
         f"--oem 3 --psm 8{whitelist}",
         f"--oem 3 --psm 6{whitelist}",
         f"--oem 3 --psm 11{whitelist}",
+        f"--oem 3 --psm 8{digits}",
+        f"--oem 3 --psm 7{digits}",
         "--oem 3 --psm 6",
         "--oem 3 --psm 7",
     ]
@@ -2421,7 +2478,11 @@ def _ocr_single_roi(
                 for i, txt in enumerate(data.get("text", [])):
                     conf = int(float(data["conf"][i])) if str(data["conf"][i]).lstrip("-").isdigit() else -1
                     t = (txt or "").strip()
-                    if conf >= 35 and t:
+                    if not t:
+                        continue
+                    # Digits (avenue / door numbers) need a lower conf floor than letters
+                    min_conf = OCR_DIGIT_WORD_CONF_MIN if t.isdigit() else OCR_WORD_CONF_MIN
+                    if conf >= min_conf:
                         words.append(t.upper())
                 if words:
                     _consider_raw(" ".join(words))
@@ -2437,7 +2498,11 @@ def _ocr_single_roi(
                 top = max(results, key=lambda r: r.score)
                 if top.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(top.text):
                     return
-                if top.score >= OCR_STREET_EARLY_EXIT_SCORE and looks_like_street_name(top.text):
+                if (
+                    top.score >= OCR_STREET_EARLY_EXIT_SCORE
+                    and looks_like_street_name(top.text)
+                    and _street_read_is_complete(top.text)
+                ):
                     return
 
 
@@ -2545,7 +2610,13 @@ def run_ocr_on_signs(frame_bgr: np.ndarray, detections: List[Detection]) -> List
         best = max(results, key=lambda r: r.score)
         if best.score >= OCR_EARLY_EXIT_SCORE and is_known_sign_word(best.text):
             return True
-        if best.score >= OCR_STREET_EARLY_EXIT_SCORE and looks_like_street_name(best.text):
+        if (
+            best.score >= OCR_STREET_EARLY_EXIT_SCORE
+            and looks_like_street_name(best.text)
+            and _street_read_is_complete(best.text)
+        ):
+            return True
+        if best.score >= OCR_NUMBER_AUTO_SCORE and is_number_like_text(best.text):
             return True
         return False
 
@@ -2670,27 +2741,54 @@ def apply_ocr_scan_results(new_items: List[OCRResult], manual: bool = False) -> 
     elif manual and vote_text and is_valid_sign_text(vote_text):
         confirm_sign_text(vote_text, speak_now=True)
         print(f"Manual OCR confirmed: {vote_text} (score={best.score:.2f})")
-    elif (
-        not manual
-        and best.score >= OCR_AUTO_SINGLE_READ_SCORE
-        and (
-            is_known_sign_word(vote_text)
-            or looks_like_street_name(vote_text)
-            or is_number_like_text(vote_text)
-        )
-    ):
-        confirm_sign_text(vote_text, speak_now=True)
-        print(f"High-confidence OCR confirmed: {vote_text} (score={best.score:.2f})")
+    elif not manual and vote_text:
+        # Faster confirm for numbers and known/long street plates; stricter for generic words
+        auto_ok = False
+        if is_number_like_text(vote_text) and best.score >= OCR_NUMBER_AUTO_SCORE:
+            auto_ok = True
+        elif (
+            (looks_like_street_name(vote_text) or recover_known_street_phrase(vote_text))
+            and best.score >= OCR_STREET_AUTO_SCORE
+        ):
+            auto_ok = True
+        elif is_known_sign_word(vote_text) and best.score >= OCR_AUTO_SINGLE_READ_SCORE:
+            auto_ok = True
+        if auto_ok:
+            confirm_sign_text(vote_text, speak_now=True)
+            print(f"High-confidence OCR confirmed: {vote_text} (score={best.score:.2f})")
     elif manual:
         print(f"OCR not confirmed yet — need {OCR_REQUIRE_STABLE_READS} reads in "
               f"{OCR_STABLE_WINDOW_SECONDS:.0f}s (have {vote_count})")
 
 
 def approximate_distance_from_bbox(frame_w: int, bbox: Tuple[int, int, int, int]) -> float:
+    """Rough camera distance (metres) from bbox size — used to gate YOLO voice at ≤5 m."""
     x1, y1, x2, y2 = bbox
     box_w = max(1, x2 - x1)
-    rel = box_w / max(1, frame_w)
-    return max(0.3, min(5.0, 1.9 / (rel + 1e-3)))
+    box_h = max(1, y2 - y1)
+    rel_w = box_w / max(1, frame_w)
+    assumed_h = max(1, int(frame_w * 0.75))  # ~4:3 when only width is known
+    rel_h = box_h / float(assumed_h)
+    dist_w = 1.9 / (rel_w + 1e-3)
+    dist_h = 2.2 / (rel_h + 1e-3)
+    dist = min(dist_w, dist_h)
+    return max(0.3, min(CAMERA_OBJECT_MAX_DISTANCE_M, dist))
+
+
+def _street_read_is_complete(text: str) -> bool:
+    """Avoid locking a street OCR result that is missing its avenue/road number."""
+    if not text:
+        return False
+    words = text.upper().split()
+    if any(w in ("AVE", "AVENUE", "ROAD", "STREET") for w in words) and not any(
+        c.isdigit() for c in text
+    ):
+        # Allow known phrases that have no digit (e.g. ORCHARD ROAD)
+        recovered = recover_known_street_phrase(text)
+        if recovered and not any(c.isdigit() for c in recovered):
+            return True
+        return False
+    return True
 
 
 def try_hailo_inference_placeholder(frame_bgr: np.ndarray) -> Optional[List[Detection]]:
