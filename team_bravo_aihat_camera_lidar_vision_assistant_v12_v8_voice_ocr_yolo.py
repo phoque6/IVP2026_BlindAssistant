@@ -277,12 +277,13 @@ SLAM_ACCEPT_MEAN_ERR_M = 0.35
 CLEAR_CONFIRM_SCANS = 6
 CLEAR_REPEAT_SECONDS = 20.0
 
-ESPEAK_SPEED = 155
-ESPEAK_AMPLITUDE = 180
-ESPEAK_WORD_GAP_MS = 6
-ESPEAK_PITCH = 50
+ESPEAK_SPEED = 135          # slower = clearer (was 155; stuttering / hard to hear)
+ESPEAK_AMPLITUDE = 200
+ESPEAK_WORD_GAP_MS = 14     # small pause between words for clarity
+ESPEAK_PITCH = 45
 ESPEAK_VOICE = "en"
-WINDOWS_TTS_RATE = 0
+WINDOWS_TTS_RATE = -1       # slightly slower on Windows TTS
+VOICE_MIN_GAP_SECONDS = 0.35  # tiny settle time after a phrase starts/ends
 
 USEFUL_OBJECT_LABELS = (
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "bench",
@@ -1146,8 +1147,8 @@ def clarify_speech_text(text: str) -> str:
 
 
 def run_tts(text: str, force: bool = False) -> bool:
-    """Speak a full sentence at normal speed (not word-by-word)."""
-    global current_voice_process
+    """Speak one full continuous sentence — never word-by-word chopping."""
+    global current_voice_process, last_voice_time
     if not force and not is_voice_output_allowed():
         return False
     if not tts_checked:
@@ -1155,6 +1156,10 @@ def run_tts(text: str, force: bool = False) -> bool:
 
     spoken = clarify_speech_text(text)
     if not spoken:
+        return False
+
+    # Do not stack overlapping TTS (main cause of stutter / garbled words)
+    if not force and is_voice_speaking():
         return False
 
     if tts_backend == "espeak" and tts_executable:
@@ -1168,15 +1173,22 @@ def run_tts(text: str, force: bool = False) -> bool:
             spoken,
         ]
         try:
+            # Kill any leftover process cleanly before starting a forced speak
+            if force and is_voice_speaking():
+                stop_current_voice()
+                time.sleep(0.05)
             current_voice_process = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            last_voice_time = time.time()
             return True
         except Exception:
             print("\a", end="", flush=True)
             return False
 
     if tts_backend == "windows":
+        if force and is_voice_speaking():
+            stop_current_voice()
         return _run_tts_windows(spoken)
 
     print(f"[VOICE] {spoken}")
@@ -1275,12 +1287,13 @@ def print_voice_settings() -> None:
     print(f"- Object max distance: {CAMERA_OBJECT_MAX_DISTANCE_M:.1f} m (YOLO voice)")
     print(f"- Object repeat: {CAMERA_OBJECT_REPEAT_SECONDS:.0f} seconds")
     print(f"- Clear confirm / repeat: {CLEAR_CONFIRM_SCANS} / {CLEAR_REPEAT_SECONDS:.0f}s")
-    print(f"- Voice speed: {ESPEAK_SPEED} (v8 continuous speech)")
+    print(f"- Voice speed: {ESPEAK_SPEED} (clearer, no mid-phrase cut)")
+    print(f"- Word gap: {ESPEAK_WORD_GAP_MS} ms")
     print(f"- Temporary mute: {VOICE_TEMP_MUTE_SECONDS:.0f} seconds (button Mute / N)")
     print(f"- Alert distance: {ALERT_DISTANCE_M:.1f} m")
     print(f"- Strong warning distance: {STRONG_WARNING_DISTANCE_M:.2f} m")
     print(f"- Very close distance: {VERY_CLOSE_DISTANCE_M:.2f} m")
-    print("- Interrupt: signs and VERY_CLOSE may cut in (v8)")
+    print("- Speak: one full sentence at a time (no stutter interrupt)")
 
 
 def bbox_direction(bbox: Tuple[int, int, int, int], frame_w: int) -> str:
@@ -1633,26 +1646,31 @@ def choose_voice_message(
     detections: List[Detection], frame_w: int
 ) -> Optional[Tuple[str, str, str, bool]]:
     """
-    v8 voice priority:
-      1) Sign OCR (interrupt)
-      2) LiDAR VERY_CLOSE (interrupt)
+    v8 priority order, but never cut a phrase mid-way (prevents stutter).
+      1) Sign OCR
+      2) LiDAR VERY_CLOSE
       3) LiDAR STRONG
       4) LiDAR normal
       5) Camera YOLO objects ≤5 m when path CLEAR
       6) Path clear
     """
     now = time.time()
+    # Finish the current sentence completely before choosing the next
+    if is_voice_speaking():
+        return None
+    if (now - last_voice_time) < VOICE_MIN_GAP_SECONDS:
+        return None
 
-    # 1) Sign text has priority over obstacle warnings when due (v8)
+    # 1) Sign text when due
     if confirmed_sign_text:
         if (
             confirmed_sign_text != last_spoken_sign_text
             or (now - last_sign_voice_time) >= OCR_VOICE_REPEAT_SECONDS
         ):
             msg = build_sign_speech(confirmed_sign_text)
-            return msg, "sign", confirmed_sign_text, True
+            return msg, "sign", confirmed_sign_text, False
 
-    # 2) LiDAR VERY_CLOSE — interrupt
+    # 2) LiDAR VERY_CLOSE
     if confirmed_lidar_alert.startswith("VERY_CLOSE_"):
         if (
             confirmed_lidar_alert != last_spoken_lidar_alert
@@ -1660,7 +1678,7 @@ def choose_voice_message(
         ):
             obj = matching_camera_object(confirmed_lidar_alert, detections, frame_w)
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
-            return msg, "lidar_very_close", confirmed_lidar_alert, True
+            return msg, "lidar_very_close", confirmed_lidar_alert, False
 
     # 3) LiDAR STRONG
     if confirmed_lidar_alert.startswith("STRONG_"):
@@ -1685,7 +1703,7 @@ def choose_voice_message(
             msg = build_lidar_speech(confirmed_lidar_alert, obj)
             return msg, "lidar_normal", confirmed_lidar_alert, False
 
-    # 5) YOLO objects within 5 m — only when LiDAR path is CLEAR (v8 rule)
+    # 5) YOLO objects within 5 m — only when LiDAR path is CLEAR
     if confirmed_surroundings and confirmed_lidar_alert == "CLEAR":
         alert_key = ";".join(
             f"{normalize_object_label(l)}:{d}" for l, d in confirmed_surroundings
@@ -1697,7 +1715,6 @@ def choose_voice_message(
             msg = build_surroundings_speech(confirmed_surroundings)
             return msg, "camera_object", alert_key, False
 
-    # Fallback: single confirmed object (v8 style) if surroundings empty
     if confirmed_object_label and confirmed_lidar_alert == "CLEAR":
         alert_key = f"{confirmed_object_label}:{confirmed_object_direction}"
         if (
@@ -1722,7 +1739,7 @@ def choose_voice_message(
 def speak_chosen_message(
     spoken_text: str, category: str, track_key: str, interrupt: bool
 ) -> bool:
-    """v8 speak rules: signs and VERY_CLOSE may interrupt current speech."""
+    """Speak one clear full phrase — never kill TTS mid-sentence (stops stutter)."""
     global last_spoken_message, last_voice_time, last_spoken_was_danger
     global last_spoken_sign_text, last_sign_voice_time
     global last_spoken_object_alert, last_object_voice_time
@@ -1730,9 +1747,12 @@ def speak_chosen_message(
 
     if not is_voice_output_allowed():
         return False
-    if interrupt or category in ("sign", "lidar_very_close"):
-        if is_voice_speaking():
-            stop_current_voice()
+    # Never interrupt mid-phrase — overlapping/killed TTS sounds like stutter
+    if is_voice_speaking():
+        return False
+    if spoken_text == last_spoken_message and (time.time() - last_voice_time) < 1.0:
+        return False
+    _ = interrupt
     ok = run_tts(spoken_text)
     if not ok:
         return False
